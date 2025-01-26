@@ -82,6 +82,7 @@ pub struct Source {
 	pub labels: Option<Vec<String>>,
 	pub paths: Option<Vec<String>>,
 	pub skip_draft: Option<bool>,
+	pub target_branch: Option<String>,
 }
 
 pub fn get_data_from<T: for<'de> Deserialize<'de>>(stdin: &mut impl io::Read) -> Result<T, Box<dyn error::Error>> {
@@ -124,6 +125,7 @@ mod tests {
 					labels: None,
 					paths: None,
 					skip_draft: None,
+					target_branch: None,
 				},
 				version: None,
 			}

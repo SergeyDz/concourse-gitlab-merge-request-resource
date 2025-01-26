@@ -69,6 +69,10 @@ Check that new merge request created or the HEAD of merge requests ware updated.
      - String
      - Required
      - Private token
+   * - target_branch
+     - String
+     - Optional
+     - Only check merge requests targeting this branch. If not specified, check merge requests for all target branches.
    * - labels
      - List of String
      - Optional

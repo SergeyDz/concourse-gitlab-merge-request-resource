@@ -51,6 +51,11 @@ fn main() -> Result<()> {
 		.state(MergeRequestState::Opened)
 		.sort(SortOrder::Ascending);
 
+	/* filter mrs by target branch */
+	if let Some(target_branch) = &input.source.target_branch {
+		builder.target_branch(target_branch);  // This line filters MRs by target branch
+	}
+
 	/* filter mrs by updated date */
 	if let Some(version) = &input.version {
 		builder.updated_after(DateTime::<Utc>::from_str(&version.committed_date)?);

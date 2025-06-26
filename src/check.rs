@@ -15,10 +15,10 @@ use gitlab::api::{
 	},
 	projects::{
 		merge_requests::{
-			self,
 			MergeRequestOrderBy,
 			MergeRequestState,
 			MergeRequests,
+			MergeRequestDiffs,
 		},
 		repository::commits,
 	},
@@ -80,16 +80,14 @@ fn main() -> Result<()> {
 		/* filter mrs by filepath in their changes */
 		if let Some(paths) = &input.source.paths {
 			let patterns: Vec<Pattern> = paths.iter().map(|path| Pattern::new(path).unwrap()).collect();
-
-			let changes: MergeRequestChanges = merge_requests::MergeRequestChanges::builder()
+			let diffs: Vec<Diff> = MergeRequestDiffs::builder()
 				.project(uri.path().trim_start_matches('/').trim_end_matches(".git"))
 				.merge_request(mr.iid)
 				.build()?
 				.query(&client)?;
-			if !changes
-				.changes
+			if !diffs
 				.iter()
-				.any(|change| patterns.iter().any(|pattern| pattern.matches(&change.new_path)))
+				.any(|diff| patterns.iter().any(|pattern| pattern.matches(&diff.new_path)))
 			{
 				continue;
 			}

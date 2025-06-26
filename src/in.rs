@@ -163,6 +163,7 @@ mod tests {
 				private_token: "".to_owned(),
 				uri: "".to_owned(),
 				skip_draft: None,
+				target_branch: None,
 			},
 			version: None,
 		};

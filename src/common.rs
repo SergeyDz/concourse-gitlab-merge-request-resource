@@ -56,6 +56,19 @@ pub struct MergeRequestChanges {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+pub struct Diff {
+	pub old_path: String,
+	pub new_path: String,
+	pub a_mode: String,
+	pub b_mode: String,
+	pub diff: String,
+	pub new_file: bool,
+	pub renamed_file: bool,
+	pub deleted_file: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct MergeRequest {
 	pub iid: u64,
 	pub title: String,

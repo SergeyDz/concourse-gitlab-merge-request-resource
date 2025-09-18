@@ -54,19 +54,17 @@ fn main() -> Result<()> {
 	/* Apply state filter only if we don't have a previous version */
 	if input.version.is_none() {
 		builder.state(MergeRequestState::Opened);
-	} else {
-		/* When we have a previous version, look at all states so we don't miss new MRs */
-		builder.state(MergeRequestState::All);
 	}
-
-	/* filter mrs by target branch */
-	if let Some(target_branch) = &input.source.target_branch {
-		builder.target_branch(target_branch);  // This line filters MRs by target branch
-	}
+	/* When we have a previous version, don't filter by state so we don't miss new MRs */
 
 	/* filter mrs by updated date */
 	if let Some(version) = &input.version {
 		builder.updated_after(DateTime::<Utc>::from_str(&version.committed_date)?);
+	}
+
+	/* filter mrs by target branch */
+	if let Some(target_branch) = &input.source.target_branch {
+		builder.target_branch(target_branch);
 	}
 
 	/* filter mrs by labels */

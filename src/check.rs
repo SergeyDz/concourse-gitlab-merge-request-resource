@@ -46,10 +46,18 @@ fn main() -> Result<()> {
 
 	let mut builder = MergeRequests::builder();
 	builder
-		.project(uri.path().trim_start_matches('/').trim_end_matches(".git"))
+		.project(uri.path().trim_start_matches('/')
+		.trim_end_matches(".git"))
 		.order_by(MergeRequestOrderBy::UpdatedAt)
-		.state(MergeRequestState::Opened)
 		.sort(SortOrder::Ascending);
+
+	/* Apply state filter only if we don't have a previous version */
+	if input.version.is_none() {
+		builder.state(MergeRequestState::Opened);
+	} else {
+		/* When we have a previous version, look at all states so we don't miss new MRs */
+		builder.state(MergeRequestState::All);
+	}
 
 	/* filter mrs by target branch */
 	if let Some(target_branch) = &input.source.target_branch {

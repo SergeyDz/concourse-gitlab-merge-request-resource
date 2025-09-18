@@ -164,6 +164,7 @@ mod tests {
 				uri: "".to_owned(),
 				skip_draft: None,
 				target_branch: None,
+				max_age_days: None,
 			},
 			version: None,
 		};

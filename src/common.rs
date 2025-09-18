@@ -96,6 +96,8 @@ pub struct Source {
 	pub paths: Option<Vec<String>>,
 	pub skip_draft: Option<bool>,
 	pub target_branch: Option<String>,
+	/// Maximum age in days for merge requests to be considered (default: 90 days / 3 months)
+	pub max_age_days: Option<u32>,
 }
 
 pub fn get_data_from<T: for<'de> Deserialize<'de>>(stdin: &mut impl io::Read) -> Result<T, Box<dyn error::Error>> {
@@ -139,6 +141,7 @@ mod tests {
 					paths: None,
 					skip_draft: None,
 					target_branch: None,
+					max_age_days: None,
 				},
 				version: None,
 			}

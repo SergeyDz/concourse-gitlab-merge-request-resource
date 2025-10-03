@@ -257,14 +257,21 @@ fn main() -> Result<()> {
 		
 		let mut newer_versions = Vec::new();
 		for version in all_versions.into_iter() {
-			eprintln!("  Checking MR #{}: {} > {} = {}", 
+			// Parse both dates to UTC for proper timezone-aware comparison
+			let candidate_dt = DateTime::<Utc>::from_str(&version.committed_date)?;
+			let current_dt = DateTime::<Utc>::from_str(&current_version.committed_date)?;
+			let is_newer = candidate_dt > current_dt;
+			
+			eprintln!("  Checking MR #{}: {} ({}) > {} ({}) = {}", 
 				version.iid,
 				version.committed_date,
+				candidate_dt,
 				current_version.committed_date,
-				version.committed_date > current_version.committed_date
+				current_dt,
+				is_newer
 			);
 			
-			if version.committed_date > current_version.committed_date {
+			if is_newer {
 				eprintln!("    ✅ INCLUDED: Newer than current version");
 				newer_versions.push(version);
 			} else {

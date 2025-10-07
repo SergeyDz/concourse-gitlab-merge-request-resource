@@ -254,6 +254,7 @@ fn main() -> Result<()> {
 	let filtered_versions = if let Some(current_version) = &input.version {
 		eprintln!("\nFiltering versions newer than current version:");
 		eprintln!("Current version committed_date: {}", current_version.committed_date);
+		eprintln!("Current version iid: {}", current_version.iid);
 		
 		let mut newer_versions = Vec::new();
 		for version in all_versions.into_iter() {
@@ -262,20 +263,33 @@ fn main() -> Result<()> {
 			let current_dt = DateTime::<Utc>::from_str(&current_version.committed_date)?;
 			let is_newer = candidate_dt > current_dt;
 			
-			eprintln!("  Checking MR #{}: {} ({}) > {} ({}) = {}", 
+			// Include MR if:
+			// 1. It has a newer commit (committed_date > current), OR
+			// 2. It has the same commit date BUT different IID AND higher IID (ensures forward-only progression)
+			//    This handles multiple MRs with same SHA while preventing carousel effect
+			let is_different_mr = version.iid != current_version.iid;
+			let is_higher_iid = version.iid > current_version.iid;
+			let is_newer_or_different_mr = is_newer || (candidate_dt == current_dt && is_different_mr && is_higher_iid);
+			
+			eprintln!("  Checking MR #{}: {} ({}) vs {} ({})", 
 				version.iid,
 				version.committed_date,
 				candidate_dt,
 				current_version.committed_date,
-				current_dt,
-				is_newer
+				current_dt
 			);
+			eprintln!("    is_newer: {}, is_different_mr: {}, is_higher_iid: {}", is_newer, is_different_mr, is_higher_iid);
 			
-			if is_newer {
-				eprintln!("    ✅ INCLUDED: Newer than current version");
+			if is_newer_or_different_mr {
+				if is_newer {
+					eprintln!("    ✅ INCLUDED: Newer than current version");
+				} else {
+					eprintln!("    ✅ INCLUDED: Same commit date but higher MR IID (iid: {} > {})", 
+						version.iid, current_version.iid);
+				}
 				newer_versions.push(version);
 			} else {
-				eprintln!("    ❌ EXCLUDED: Not newer than current version");
+				eprintln!("    ❌ EXCLUDED: Not newer or same/lower IID");
 			}
 		}
 		newer_versions

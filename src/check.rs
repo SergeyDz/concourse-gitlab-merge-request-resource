@@ -328,7 +328,55 @@ fn main() -> Result<()> {
 			eprintln!("    This is similar to a 'force push' scenario in git resources.");
 		}
 		
-		newer_versions
+		// SMART MR-AWARE FILTERING:
+		// Group by MR IID and keep only the latest commit per MR
+		// This allows parallel builds for different MRs while avoiding redundant builds for old commits
+		eprintln!("\n=== SMART MR-AWARE FILTERING ===");
+		eprintln!("Grouping {} versions by MR IID (keeping only latest commit per MR):", newer_versions.len());
+		
+		use std::collections::HashMap;
+		let mut mr_latest: HashMap<String, Version> = HashMap::new();
+		
+		for version in newer_versions {
+			let iid = version.iid.clone();
+			
+			// Check if we already have a version for this MR
+			if let Some(existing) = mr_latest.get(&iid) {
+				let existing_dt = DateTime::<Utc>::from_str(&existing.committed_date)?;
+				let candidate_dt = DateTime::<Utc>::from_str(&version.committed_date)?;
+				
+				// Keep the later commit
+				if candidate_dt > existing_dt {
+					eprintln!("  MR #{}: Replacing {} with newer {}", iid, existing.committed_date, version.committed_date);
+					mr_latest.insert(iid, version);
+				} else {
+					eprintln!("  MR #{}: Keeping {} (skipping older {})", iid, existing.committed_date, version.committed_date);
+				}
+			} else {
+				eprintln!("  MR #{}: First version found: {}", iid, version.committed_date);
+				mr_latest.insert(iid, version);
+			}
+		}
+		
+		// Always ensure current version is included (Concourse contract)
+		let current_iid = &current_version.iid;
+		if !mr_latest.contains_key(current_iid) {
+			eprintln!("\n⚠️  Adding current version back (required by Concourse contract)");
+			eprintln!("  MR #{}: {}", current_iid, current_version.committed_date);
+			mr_latest.insert(current_iid.clone(), current_version.clone());
+		}
+		
+		// Convert HashMap back to Vec and sort by committed_date
+		let mut result: Vec<Version> = mr_latest.into_values().collect();
+		result.sort_by(|a, b| a.committed_date.cmp(&b.committed_date));
+		
+		eprintln!("\nFinal MR-filtered versions ({} MRs, each with latest commit only):", result.len());
+		for (i, version) in result.iter().enumerate() {
+			eprintln!("  {}. MR #{} - {} - SHA: {}", 
+				i + 1, version.iid, version.committed_date, version.sha);
+		}
+		
+		result
 	} else {
 		eprintln!("No current version to compare against - including all candidate versions");
 		all_versions

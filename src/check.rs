@@ -272,7 +272,7 @@ fn main() -> Result<()> {
 			
 			// Calculate time window for bulk MR detection
 			let time_diff_minutes = (current_dt.timestamp() - candidate_dt.timestamp()) / 60;
-			let within_bulk_window = time_diff_minutes >= 0 && time_diff_minutes <= 10;
+			let within_bulk_window = (0..=10).contains(&time_diff_minutes);
 			
 			// Include MR if:
 			// 1. Newer commit time (obvious case)

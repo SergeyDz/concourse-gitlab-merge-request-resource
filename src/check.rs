@@ -57,19 +57,14 @@ fn main() -> Result<()> {
 
 	// Determine the starting point for filtering
 	let updated_after = if let Some(version) = &input.version {
-		// If we have a previous version, use its committed date minus a margin
+		// If we have a previous version, use its committed date as the starting point
 		let previous_committed_date = DateTime::<Utc>::from_str(&version.committed_date)?;
 		eprintln!("Previous version found:");
 		eprintln!("  - IID: {}", version.iid);
 		eprintln!("  - SHA: {}", version.sha);
 		eprintln!("  - Committed date: {}", version.committed_date);
-		
-		// Subtract margin to catch bulk-created MRs
-		// This handles cases where multiple MRs are created/updated within a short time window
-		let margin = chrono::Duration::minutes(10);
-		let filter_time = previous_committed_date - margin;
-		eprintln!("Using previous version's committed_date - 10min margin as updated_after filter: {}", filter_time);
-		filter_time
+		eprintln!("Using previous version's committed_date as updated_after filter: {}", previous_committed_date);
+		previous_committed_date
 	} else {
 		eprintln!("No previous version found, using cutoff_date as updated_after filter: {}", cutoff_date);
 		cutoff_date
@@ -267,20 +262,14 @@ fn main() -> Result<()> {
 			let candidate_dt = DateTime::<Utc>::from_str(&version.committed_date)?;
 			let current_dt = DateTime::<Utc>::from_str(&current_version.committed_date)?;
 			let is_newer = candidate_dt > current_dt;
-			let is_same_time = candidate_dt == current_dt;
-			let is_different_mr = version.iid != current_version.iid;
-			
-			// Calculate time window for bulk MR detection
-			let time_diff_minutes = (current_dt.timestamp() - candidate_dt.timestamp()) / 60;
-			let within_bulk_window = (0..=10).contains(&time_diff_minutes);
 			
 			// Include MR if:
-			// 1. Newer commit time (obvious case)
-			// 2. Same commit time AND different MR (crossplane case - same SHA)
-			// 3. Within 10-minute window AND different MR (external-dns case - bulk creation)
-			let is_newer_or_different_mr = is_newer 
-				|| (is_same_time && is_different_mr)
-				|| (within_bulk_window && is_different_mr);
+			// 1. It has a newer commit (committed_date > current), OR
+			// 2. It has the same commit date BUT different IID AND higher IID (ensures forward-only progression)
+			//    This handles multiple MRs with same SHA while preventing carousel effect
+			let is_different_mr = version.iid != current_version.iid;
+			let is_higher_iid = version.iid > current_version.iid;
+			let is_newer_or_different_mr = is_newer || (candidate_dt == current_dt && is_different_mr && is_higher_iid);
 			
 			eprintln!("  Checking MR #{}: {} ({}) vs {} ({})", 
 				version.iid,
@@ -289,22 +278,18 @@ fn main() -> Result<()> {
 				current_version.committed_date,
 				current_dt
 			);
-			eprintln!("    is_newer: {}, is_same_time: {}, is_different_mr: {}", 
-				is_newer, is_same_time, is_different_mr);
-			eprintln!("    time_diff_minutes: {}, within_bulk_window: {}", 
-				time_diff_minutes, within_bulk_window);
+			eprintln!("    is_newer: {}, is_different_mr: {}, is_higher_iid: {}", is_newer, is_different_mr, is_higher_iid);
 			
 			if is_newer_or_different_mr {
 				if is_newer {
 					eprintln!("    ✅ INCLUDED: Newer than current version");
-				} else if is_same_time {
-					eprintln!("    ✅ INCLUDED: Same commit time but different MR (same SHA scenario)");
 				} else {
-					eprintln!("    ✅ INCLUDED: Within bulk creation window (created within 10 minutes)");
+					eprintln!("    ✅ INCLUDED: Same commit date but higher MR IID (iid: {} > {})", 
+						version.iid, current_version.iid);
 				}
 				newer_versions.push(version);
 			} else {
-				eprintln!("    ❌ EXCLUDED: Not newer and not within bulk window, or same MR");
+				eprintln!("    ❌ EXCLUDED: Not newer or same/lower IID");
 			}
 		}
 		newer_versions

@@ -5,6 +5,7 @@ use anyhow::{
 };
 use chrono::{
 	DateTime,
+	Datelike,
 	Utc,
 };
 use common::*;
@@ -218,14 +219,28 @@ fn main() -> Result<()> {
 		eprintln!("  - SHA: {}", version.sha);
 		eprintln!("  - Committed date: {}", version.committed_date);
 		
-		// Subtract margin to catch bulk-created MRs
-		// This handles cases where multiple MRs are created/updated within a short time window
-		// IMPORTANT: Margin must be SMALL to prevent infinite loops from pipeline comments
-		// If margin >= build time, comments will retrigger builds infinitely
-		let margin = chrono::Duration::minutes(10);
-		let filter_time = previous_committed_date - margin;
-		eprintln!("Using previous version's committed_date - {}min margin as updated_after filter: {}", margin.num_minutes(), filter_time);
-		filter_time
+		// CRITICAL: Detect if this is a FAKE resurrection date
+		// Resurrection dates are >= 2099 (far future) or == current UTC time
+		// These break the updated_after filter, so we IGNORE them and use cutoff_date instead
+		let is_far_future = previous_committed_date.year() >= 2099;
+		let time_diff_from_now = (Utc::now() - previous_committed_date).num_seconds().abs();
+		let is_recent_resurrection = time_diff_from_now < 3600; // Within 1 hour = likely resurrection
+		
+		if is_far_future {
+			eprintln!("⚠️  Previous version has FAKE FUTURE DATE (year >= 2099) - this is a resurrection!");
+			eprintln!("   Ignoring fake date, using cutoff_date instead to prevent filter breakage");
+			cutoff_date
+		} else if is_recent_resurrection {
+			eprintln!("⚠️  Previous version date is very recent ({} seconds from now) - likely resurrection!", time_diff_from_now);
+			eprintln!("   Ignoring recent resurrection date, using cutoff_date instead");
+			cutoff_date
+		} else {
+			// Normal case: Use previous version's date with margin
+			let margin = chrono::Duration::minutes(10);
+			let filter_time = previous_committed_date - margin;
+			eprintln!("Using previous version's committed_date - {}min margin as updated_after filter: {}", margin.num_minutes(), filter_time);
+			filter_time
+		}
 	} else {
 		eprintln!("No previous version found, using cutoff_date as updated_after filter: {}", cutoff_date);
 		cutoff_date
@@ -678,16 +693,21 @@ fn main() -> Result<()> {
 			// It's STUCK in Concourse DB with low check_order
 			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
 			eprintln!("     This MR is stuck in Concourse DB with low check_order!");
-			eprintln!("     🚑 RESURRECTING with fake date (2099-12-31) to force rebuild!");
+			eprintln!("     🚑 RESURRECTING with current UTC time as fake date to force rebuild!");
 			
-			// Create resurrected version with FAKE FUTURE DATE
+			// Create resurrected version with CURRENT UTC TIME as fake date
 			// This creates a DIFFERENT version_sha256 in Concourse
-			// Concourse will see it as NEW and save it with HIGH check_order
-			// CRITICAL: Future date = highest check_order = builds FIRST
-			// (Concourse's NextEveryVersion uses ORDER BY check_order ASC)
+			// CRITICAL: Use current time instead of far future (2099) because:
+			// - Far future breaks next check (updated_after filter becomes 2099!)
+			// - Current time ensures resurrected builds appear at top NOW
+			// - Future real MRs will have newer dates and build after current time
+			// - Perfect chronological order maintained! ✅
+			let resurrection_date = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+			eprintln!("     Using resurrection date: {}", resurrection_date);
+			
 			let resurrected = Version {
 				iid: version.iid.clone(),
-				committed_date: "2099-12-31T23:59:59Z".to_string(), // Future = sorts last = highest check_order
+				committed_date: resurrection_date,
 				sha: version.sha.clone(),
 			};
 			
@@ -710,9 +730,9 @@ fn main() -> Result<()> {
 	
 	if !resurrected_versions.is_empty() {
 		eprintln!("\n🚑 RESURRECTION MODE ACTIVE!");
-		eprintln!("   Returning {} stuck MR(s) with fake date (2099-12-31)", resurrected_versions.len());
+		eprintln!("   Returning {} stuck MR(s) with current UTC time as fake date", resurrected_versions.len());
 		eprintln!("   This creates NEW version_sha256 in Concourse → Forces rebuild!");
-		eprintln!("   IMPORTANT: Future date = highest check_order = builds FIRST!");
+		eprintln!("   IMPORTANT: Current time = appears NOW but future MRs will be newer!");
 		for v in &resurrected_versions {
 			eprintln!("   - MR #{} (SHA: {})", v.iid, v.sha);
 		}

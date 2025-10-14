@@ -75,6 +75,12 @@ struct CheckState {
 	/// Once a version is returned, it should NEVER be returned again
 	/// to prevent incrementCheckOrder from re-bumping its check_order.
 	returned_shas: HashSet<String>,
+	
+	/// SHA hashes that have been resurrected (returned with fake date).
+	/// These should NEVER be resurrected again, even if they're stuck.
+	/// Once resurrected, they either build or they don't - no retry.
+	#[serde(default)]
+	resurrected_shas: HashSet<String>,
 }
 
 impl CheckState {
@@ -104,9 +110,10 @@ impl CheckState {
 			Ok(contents) => {
 				match serde_json::from_str::<CheckState>(&contents) {
 					Ok(state) => {
-						eprintln!("📂 Loaded state from {}: {} returned SHAs", 
+						eprintln!("📂 Loaded state from {}: {} returned SHAs, {} resurrected SHAs", 
 							path.display(), 
-							state.returned_shas.len()
+							state.returned_shas.len(),
+							state.resurrected_shas.len()
 						);
 						state
 					}
@@ -157,9 +164,10 @@ impl CheckState {
 		fs::rename(&temp_path, &path)
 			.map_err(|e| anyhow!("Failed to rename temp state file: {}", e))?;
 		
-		eprintln!("💾 Saved state to {}: {} returned SHAs", 
+		eprintln!("💾 Saved state to {}: {} returned SHAs, {} resurrected SHAs", 
 			path.display(), 
-			self.returned_shas.len()
+			self.returned_shas.len(),
+			self.resurrected_shas.len()
 		);
 		
 		Ok(())
@@ -173,6 +181,16 @@ impl CheckState {
 	/// Mark a version SHA as returned.
 	fn mark_returned(&mut self, sha: String) {
 		self.returned_shas.insert(sha);
+	}
+	
+	/// Check if a version SHA has been resurrected before.
+	fn was_resurrected(&self, sha: &str) -> bool {
+		self.resurrected_shas.contains(sha)
+	}
+	
+	/// Mark a version SHA as resurrected (prevents infinite resurrection loops).
+	fn mark_resurrected(&mut self, sha: String) {
+		self.resurrected_shas.insert(sha);
 	}
 }
 
@@ -220,11 +238,11 @@ fn main() -> Result<()> {
 		eprintln!("  - Committed date: {}", version.committed_date);
 		
 		// CRITICAL: Detect if this is a FAKE resurrection date
-		// Resurrection dates are >= 2099 (far future) or == current UTC time
+		// Resurrection dates are >= 2099 (far future) or very recent (within 2 minutes)
 		// These break the updated_after filter, so we IGNORE them and use cutoff_date instead
 		let is_far_future = previous_committed_date.year() >= 2099;
 		let time_diff_from_now = (Utc::now() - previous_committed_date).num_seconds().abs();
-		let is_recent_resurrection = time_diff_from_now < 3600; // Within 1 hour = likely resurrection
+		let is_recent_resurrection = time_diff_from_now < 120; // Within 2 minutes = likely resurrection
 		
 		if is_far_future {
 			eprintln!("⚠️  Previous version has FAKE FUTURE DATE (year >= 2099) - this is a resurrection!");
@@ -648,16 +666,67 @@ fn main() -> Result<()> {
 	eprintln!("\n=== RESURRECTION MODE CHECK ===");
 	eprintln!("Checking for MRs stuck in Concourse DB (returned before but not current)");
 	
-	// Check if any filtered versions are stuck
+	// CRITICAL: Disable resurrection if current version is a recent fake resurrection!
+	// This prevents infinite loops where we keep resurrecting the same MRs over and over.
+	// 
+	// **THE PROBLEM**:
+	// 1. Resurrect MR #59 with fake date 22:13:57
+	// 2. It builds successfully
+	// 3. Next check (22:15:16): Current is #59 with fake date 22:13:57
+	// 4. We detect it as "recent resurrection" → Use cutoff_date filter
+	// 5. Fetch all MRs from GitLab with REAL dates
+	// 6. MR #60, #61 in state but not current → Resurrect AGAIN!
+	// 7. Infinite loop! ♾️
+	// 
+	// **THE FIX**:
+	// Use a SHORT cooldown (2 minutes) to prevent immediate re-resurrection.
+	// This is enough time to:
+	// 1. Let the build start (usually <30 seconds)
+	// 2. Prevent same MR from being resurrected twice
+	// 3. But allow OTHER stuck MRs to be resurrected soon after
+	// 
+	// **WHY 2 MINUTES**:
+	// - Too short (30 sec): Might catch same MR twice in rapid checks
+	// - Too long (1 hour): Other stuck MRs can't be resurrected
+	// - 2 minutes: Safe middle ground - build starts, others can resurrect soon
+	let resurrection_enabled = if let Some(version) = &input.version {
+		let previous_committed_date = DateTime::<Utc>::from_str(&version.committed_date)?;
+		let is_far_future = previous_committed_date.year() >= 2099;
+		let time_diff_from_now = (Utc::now() - previous_committed_date).num_seconds().abs();
+		let is_recent = time_diff_from_now < 120; // 2 minutes (not 1 hour!)
+		
+		if is_far_future || is_recent {
+			eprintln!("⛔ RESURRECTION DISABLED: Current version has fake/recent date (within 2 min)");
+			eprintln!("   This prevents infinite loops - resurrection will re-enable in 2 minutes");
+			false
+		} else {
+			eprintln!("✅ Resurrection enabled (current version date is >2 min old)");
+			true
+		}
+	} else {
+		eprintln!("✅ Resurrection enabled (no current version)");
+		true
+	};
+	
+	if !resurrection_enabled {
+		eprintln!("⏭️  Skipping resurrection check (disabled due to recent fake current version)");
+	}
+	
+	// Check if any filtered versions are stuck (only if resurrection enabled)
 	let current_sha = input.version.as_ref().map(|v| v.sha.as_str());
 	
-	for version in &filtered_versions {
-		if state.was_returned(&version.sha) && Some(version.sha.as_str()) != current_sha {
-			// This version was returned before but is NOT current
-			// If it's been >2 hours, it's probably stuck in DB
-			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
-			eprintln!("     This suggests it's stuck in Concourse DB with low check_order");
-			eprintln!("     Will resurrect with fake date to force rebuild");
+	if resurrection_enabled {
+		for version in &filtered_versions {
+			if state.was_returned(&version.sha) && Some(version.sha.as_str()) != current_sha {
+				// Check if already resurrected before
+				if state.was_resurrected(&version.sha) {
+					eprintln!("  ⏭️  MR #{} (SHA: {}) was ALREADY resurrected before - skipping", version.iid, version.sha);
+				} else {
+					eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
+					eprintln!("     This suggests it's stuck in Concourse DB with low check_order");
+					eprintln!("     Will resurrect with fake date to force rebuild");
+				}
+			}
 		}
 	}
 	
@@ -688,7 +757,8 @@ fn main() -> Result<()> {
 		
 		let was_returned = state.was_returned(&version.sha);
 		
-		if was_returned {
+		// Only resurrect if: 1) was returned before, 2) not current, 3) resurrection enabled, 4) NOT already resurrected
+		if was_returned && resurrection_enabled && !state.was_resurrected(&version.sha) {
 			// This version was returned before but is NOT current
 			// It's STUCK in Concourse DB with low check_order
 			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
@@ -718,6 +788,11 @@ fn main() -> Result<()> {
 			// - If we saved fake SHA, we wouldn't recognize the real one
 			resurrected_shas.push(version.sha.clone());
 			resurrected_versions.push(resurrected);
+		} else if was_returned {
+			// Was returned before, but resurrection is DISABLED
+			// This happens when current version is a fake resurrection
+			// Just filter it out silently (don't return it again)
+			eprintln!("  ⏭️  Skipping MR #{} (SHA: {}) - was returned before (resurrection disabled)", version.iid, version.sha);
 		} else {
 			eprintln!("  ✅ Keeping MR #{} (SHA: {}) - new version", version.iid, version.sha);
 			new_versions.push(version);
@@ -738,6 +813,14 @@ fn main() -> Result<()> {
 		}
 	}
 	
+	// CRITICAL: Track NEW SHAs before moving new_versions
+	// We need to save these to state, but NOT the resurrected ones
+	let new_shas_to_save: Vec<String> = new_versions
+		.iter()
+		.filter(|v| Some(v.sha.as_str()) != current_sha)
+		.map(|v| v.sha.clone())
+		.collect();
+	
 	// Combine: resurrected first (fake old date sorts first), then new versions
 	// This ensures stuck MRs build BEFORE new ones
 	let mut final_versions = resurrected_versions;
@@ -748,21 +831,18 @@ fn main() -> Result<()> {
 	
 	eprintln!("\nPost-filter: {} versions to return", final_versions.len());
 	
-	// CRITICAL: Mark ALL returned SHAs (including resurrected ORIGINAL SHAs)
-	// For resurrected versions, we save the ORIGINAL SHA (not fake date version)
-	// because next check will fetch same MR from GitLab with real date/SHA
-	let mut new_shas_to_save: Vec<String> = final_versions
-		.iter()
-		.filter(|v| Some(v.sha.as_str()) != current_sha)
-		.map(|v| v.sha.clone())
-		.collect();
+	// new_shas_to_save was already computed before moving new_versions (see above)
+	// DO NOT add resurrected_shas - they're already in state!
 	
-	// Add resurrected original SHAs (already in new_shas_to_save, but explicit for clarity)
-	new_shas_to_save.extend(resurrected_shas);
-	new_shas_to_save.sort();
-	new_shas_to_save.dedup(); // Remove duplicates
-	
-	
+	// CRITICAL: Mark resurrected SHAs to prevent infinite resurrection loops!
+	// Once a SHA is resurrected, it should NEVER be resurrected again.
+	if !resurrected_shas.is_empty() {
+		eprintln!("Marking {} SHAs as resurrected (prevents infinite loops):", resurrected_shas.len());
+		for sha in &resurrected_shas {
+			eprintln!("  - {}", sha);
+			state.mark_resurrected(sha.clone());
+		}
+	}
 	
 	if !new_shas_to_save.is_empty() {
 		eprintln!("Marking {} new SHAs as returned (excluding current version):", new_shas_to_save.len());
@@ -770,14 +850,17 @@ fn main() -> Result<()> {
 			eprintln!("  - {}", sha);
 			state.mark_returned(sha.clone());
 		}
-		
+	}
+	
+	// Save state if anything changed (new SHAs or resurrected SHAs)
+	if !new_shas_to_save.is_empty() || !resurrected_shas.is_empty() {
 		// Save state (non-fatal if fails)
 		if let Err(e) = state.save() {
 			eprintln!("⚠️  Warning: Failed to save state: {}", e);
 			eprintln!("   This is non-fatal, but next check may return duplicate versions.");
 		}
 	} else {
-		eprintln!("No new SHAs to save to state (only returning current version or empty)");
+		eprintln!("No state changes (no new SHAs, no resurrections)");
 	}
 	
 	eprintln!("\n=== FINAL RESULT ===");

@@ -589,20 +589,89 @@ fn main() -> Result<()> {
 	// Load existing state
 	let mut state = CheckState::load();
 	
-	// CRITICAL FIX FOR MIGRATION: Remove current version from state if present
-	// This handles the case where old code saved the current version to state
+	// CRITICAL MIGRATION: Remove ALL non-current SHAs from state to enable resurrection
+	// This is a one-time migration to fix stuck MRs from the old bug
 	if let Some(current_version) = &input.version {
-		if state.returned_shas.contains(&current_version.sha) {
-			eprintln!("🔧 MIGRATION: Removing current version SHA {} from state (old bug)", current_version.sha);
-			eprintln!("   This is a one-time cleanup from previous version that incorrectly saved current version.");
-			state.returned_shas.remove(&current_version.sha);
+		let original_count = state.returned_shas.len();
+		let current_sha = &current_version.sha;
+		
+		// Keep ONLY the current version SHA (if present), remove everything else
+		state.returned_shas.retain(|sha| sha == current_sha);
+		
+		let removed_count = original_count - state.returned_shas.len();
+		
+		if removed_count > 0 {
+			eprintln!("🔧 MIGRATION V2: Clearing state for resurrection mode");
+			eprintln!("   Removed {} stuck SHA(s) from state", removed_count);
+			eprintln!("   Kept current version SHA: {}", current_sha);
+			eprintln!("   This enables resurrection mode to detect and rebuild stuck MRs");
 			
 			// Save cleaned state immediately
 			if let Err(e) = state.save() {
 				eprintln!("⚠️  Warning: Failed to save cleaned state: {}", e);
 			} else {
-				eprintln!("✅ State cleaned and saved");
+				eprintln!("✅ State cleaned: {} → {} SHAs", original_count, state.returned_shas.len());
 			}
+		}
+	} else {
+		// No current version = first run
+		// Clear state entirely to start fresh
+		if !state.returned_shas.is_empty() {
+			eprintln!("🔧 MIGRATION V2: No current version, clearing entire state");
+			let count = state.returned_shas.len();
+			state.returned_shas.clear();
+			
+			if let Err(e) = state.save() {
+				eprintln!("⚠️  Warning: Failed to save cleaned state: {}", e);
+			} else {
+				eprintln!("✅ State cleared: {} → 0 SHAs (first run)", count);
+			}
+		}
+	}
+	
+	// ========================================================================
+	// RESURRECTION MODE: Force stuck MRs to rebuild with fake dates
+	// ========================================================================
+	// 
+	// **THE PROBLEM**:
+	// MRs stuck in Concourse DB from old bug have low check_order values.
+	// Scheduler skips them because last_built has higher check_order.
+	// State file prevents re-returning them (already returned before).
+	// 
+	// **THE SOLUTION**:
+	// Detect MRs that were returned >2 hours ago but never built.
+	// Return them with FAKE OLD DATE (1970-01-01) to trick Concourse:
+	// - Different committed_date → Different SHA256 → NEW version
+	// - Very old date → Sorts first in list → Gets lowest check_order
+	// - Concourse sees as new → Saves to DB → BUILDS! ✅
+	// 
+	// **DETECTION LOGIC**:
+	// If a version:
+	// 1. Is in state (was returned before)
+	// 2. Was returned >2 hours ago (enough time to build)
+	// 3. Is NOT the current version (current means it DID build)
+	// → It's STUCK! Resurrect it with fake date.
+	// 
+	// **SAFETY**:
+	// - Only runs for stuck versions (already tried to build, failed)
+	// - Fake date is deterministic (same MR SHA always gets same fake date)
+	// - State tracks both real AND fake versions to prevent loops
+	// - Will resurrect ONCE, then get filtered like normal
+	// 
+	
+	eprintln!("\n=== RESURRECTION MODE CHECK ===");
+	eprintln!("Checking for MRs stuck in Concourse DB (returned before but not current)");
+	
+	// Check if any filtered versions are stuck
+	let current_sha = input.version.as_ref().map(|v| v.sha.as_str());
+	
+	for version in &filtered_versions {
+		if state.was_returned(&version.sha) && Some(version.sha.as_str()) != current_sha {
+			// This version was returned before but is NOT current
+			// If it's been >2 hours, it's probably stuck in DB
+			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
+			eprintln!("     This suggests it's stuck in Concourse DB with low check_order");
+			eprintln!("     Will resurrect with fake date to force rebuild");
 		}
 	}
 	
@@ -618,36 +687,64 @@ fn main() -> Result<()> {
 	// 3. Filtering it out breaks Concourse's scheduler
 	let current_sha = input.version.as_ref().map(|v| v.sha.as_str());
 	
-	// Filter out versions that were already returned (but keep current if present)
-	let new_versions: Vec<Version> = filtered_versions
-		.into_iter()
-		.filter(|v| {
-			// NEVER filter out the current version (Concourse needs to see it)
-			if Some(v.sha.as_str()) == current_sha {
-				eprintln!("  ⭐ Keeping MR #{} (SHA: {}) - current version (required by Concourse)", v.iid, v.sha);
-				return true;
-			}
+	// Separate versions into: new, stuck (need resurrection), and current
+	let mut new_versions = Vec::new();
+	let mut resurrected_versions = Vec::new();
+	
+	for version in filtered_versions {
+		// NEVER filter out the current version (Concourse needs to see it)
+		if Some(version.sha.as_str()) == current_sha {
+			eprintln!("  ⭐ Keeping MR #{} (SHA: {}) - current version (required by Concourse)", version.iid, version.sha);
+			new_versions.push(version);
+			continue;
+		}
+		
+		let was_returned = state.was_returned(&version.sha);
+		
+		if was_returned {
+			// This version was returned before but is NOT current
+			// Check if it's stuck (returned >2 hours ago)
+			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
+			eprintln!("     This suggests it's stuck in Concourse DB with low check_order");
+			eprintln!("     🚑 RESURRECTING with fake date to force rebuild!");
 			
-			let was_returned = state.was_returned(&v.sha);
-			if was_returned {
-				eprintln!("  🚫 Filtering out MR #{} (SHA: {}) - already returned", v.iid, v.sha);
-				false
-			} else {
-				eprintln!("  ✅ Keeping MR #{} (SHA: {}) - new version", v.iid, v.sha);
-				true
-			}
-		})
-		.collect();
+			// Create resurrected version with FAKE OLD DATE
+			// This creates a DIFFERENT version_sha256 in Concourse
+			let resurrected = Version {
+				iid: version.iid.clone(),
+				committed_date: "1970-01-01T00:00:00Z".to_string(), // Epoch = sorts first
+				sha: version.sha.clone(),
+			};
+			
+			resurrected_versions.push(resurrected);
+		} else {
+			eprintln!("  ✅ Keeping MR #{} (SHA: {}) - new version", version.iid, version.sha);
+			new_versions.push(version);
+		}
+	}
 	
-	eprintln!("\nPost-filter: {} versions to return", new_versions.len());
+	eprintln!("\nResurrection summary:");
+	eprintln!("  - New versions: {}", new_versions.len());
+	eprintln!("  - Resurrected (stuck) versions: {}", resurrected_versions.len());
 	
-	// CRITICAL: Only mark NEW versions as returned (NOT the current version)
-	// This prevents filtering out the current version on subsequent checks
-	let new_shas_to_save: Vec<String> = new_versions
+	// Combine: resurrected first (fake old date sorts first), then new versions
+	// This ensures stuck MRs build BEFORE new ones
+	let mut final_versions = resurrected_versions;
+	final_versions.extend(new_versions);
+	
+	// Re-sort by committed_date to ensure proper ordering
+	final_versions.sort_by(|a, b| a.committed_date.cmp(&b.committed_date));
+	
+	eprintln!("\nPost-filter: {} versions to return", final_versions.len());
+	
+	// CRITICAL: Mark ALL returned SHAs (including resurrected) to prevent infinite loops
+	// Resurrected versions get marked so they won't be resurrected again next time
+	let new_shas_to_save: Vec<String> = final_versions
 		.iter()
 		.filter(|v| Some(v.sha.as_str()) != current_sha)
 		.map(|v| v.sha.clone())
 		.collect();
+	
 	
 	if !new_shas_to_save.is_empty() {
 		eprintln!("Marking {} new SHAs as returned (excluding current version):", new_shas_to_save.len());
@@ -666,9 +763,9 @@ fn main() -> Result<()> {
 	}
 	
 	eprintln!("\n=== FINAL RESULT ===");
-	eprintln!("Returning {} versions to Concourse", new_versions.len());
+	eprintln!("Returning {} versions to Concourse", final_versions.len());
 	
-	if new_versions.is_empty() {
+	if final_versions.is_empty() {
 		eprintln!("📭 NO NEW VERSIONS TO RETURN");
 		eprintln!("This means either:");
 		eprintln!("  1. No open MRs were found");
@@ -678,19 +775,22 @@ fn main() -> Result<()> {
 		eprintln!("\n💡 This is NORMAL and SAFE - Concourse will continue using existing versions.");
 		eprintln!("   No builds will be triggered. Scheduler will keep checking for new versions.");
 	} else {
-		eprintln!("📬 RETURNING NEW VERSIONS:");
-		for (i, version) in new_versions.iter().enumerate() {
-			eprintln!("  {}. MR #{} - committed: {} - SHA: {}", 
-				i + 1, version.iid, version.committed_date, version.sha);
+		eprintln!("📬 RETURNING VERSIONS:");
+		for (i, version) in final_versions.iter().enumerate() {
+			let is_resurrected = version.committed_date == "1970-01-01T00:00:00Z";
+			let marker = if is_resurrected { "🚑 RESURRECTED" } else { "✅ NEW" };
+			eprintln!("  {}. {} - MR #{} - committed: {} - SHA: {}", 
+				i + 1, marker, version.iid, version.committed_date, version.sha);
 		}
-		eprintln!("\n💡 These versions will:");
-		eprintln!("   1. Get saved to Concourse DB (if not already present)");
-		eprintln!("   2. Get assigned check_order values sequentially");
-		eprintln!("   3. Build in chronological order (oldest first)");
-		eprintln!("   4. NEVER be returned again (tracked in state file)");
+		eprintln!("\n💡 What will happen:");
+		eprintln!("   1. Resurrected versions get NEW version_sha256 (fake date)");
+		eprintln!("   2. Concourse sees them as NEW → saves to DB");
+		eprintln!("   3. They get check_order sequentially (resurrected first)");
+		eprintln!("   4. They BUILD! (Finally!) ✅");
+		eprintln!("   5. After building, they won't be resurrected again (in state)");
 	}
 
-	println!("{}", serde_json::to_string_pretty(&new_versions)?);
+	println!("{}", serde_json::to_string_pretty(&final_versions)?);
 
 	Ok(())
 }

@@ -66,7 +66,8 @@ fn main() -> Result<()> {
 	eprintln!("Current time (UTC): {}", Utc::now());
 	eprintln!("Max age days: {}", max_age_days);
 	eprintln!("Cutoff date: {}", cutoff_date);
-	eprintln!("Note: Age filtering is based on commit.committed_date, not MR.updated_at");
+	eprintln!("Note: Age filtering is based on MR.updated_at, not commit.committed_date");
+	eprintln!("Note: Version deduplication uses {{iid, committed_date, sha}} to prevent comment loops");
 
 	// Determine the starting point for filtering
 	let updated_after = if let Some(version) = &input.version {
@@ -79,9 +80,11 @@ fn main() -> Result<()> {
 		
 		// Subtract margin to catch bulk-created MRs
 		// This handles cases where multiple MRs are created/updated within a short time window
+		// IMPORTANT: Margin must be SMALL to prevent infinite loops from pipeline comments
+		// If margin >= build time, comments will retrigger builds infinitely
 		let margin = chrono::Duration::minutes(10);
 		let filter_time = previous_committed_date - margin;
-		eprintln!("Using previous version's committed_date - 10min margin as updated_after filter: {}", filter_time);
+		eprintln!("Using previous version's committed_date - {}min margin as updated_after filter: {}", margin.num_minutes(), filter_time);
 		filter_time
 	} else {
 		eprintln!("No previous version found, using cutoff_date as updated_after filter: {}", cutoff_date);
@@ -222,34 +225,56 @@ fn main() -> Result<()> {
 		eprintln!("  Commit details:");
 		eprintln!("    Committed date: {}", commit.committed_date);
 		
-		// Handles Edge Case EC-5: Age filtering on commit date (not MR metadata update time)
-		// This ensures we filter by when code was actually committed, not when MR was last updated
-		// (e.g., comments, labels changes don't make an old commit "new")
-		let commit_date = DateTime::<Utc>::from_str(&commit.committed_date)
-			.map_err(|e| anyhow!("Failed to parse commit committed_date {}: {}", commit.committed_date, e))?;
+		// CRITICAL FIX: Age filtering based on MR updated_at (not commit date)
+		// 
+		// PROBLEM: Old commits (cherry-picks, reopened MRs) have old committed_date
+		// If we filter by commit date, recently updated/created MRs with old commits get excluded
+		//
+		// SOLUTION: Filter by MR's updated_at timestamp instead
+		// - This ensures recently updated MRs are included, regardless of commit age
+		// - GitLab API already filters by updated_after, so this aligns with API semantics
+		// - Prevents excluding legitimate MRs that were just created/reopened
+		let mr_updated_date = DateTime::<Utc>::from_str(&mr.updated_at)
+			.map_err(|e| anyhow!("Failed to parse MR updated_at {}: {}", mr.updated_at, e))?;
 		
-		eprintln!("  Checking commit age filter...");
-		eprintln!("    Commit date: {} (UTC)", commit_date);
+		eprintln!("  Checking MR age filter...");
+		eprintln!("    MR updated: {} (UTC)", mr_updated_date);
+		eprintln!("    Commit date: {} (UTC) - not used for filtering", commit.committed_date);
 		eprintln!("    Cutoff date: {} (UTC)", cutoff_date);
-		eprintln!("    Age check: {} >= {} = {}", commit_date, cutoff_date, commit_date >= cutoff_date);
+		eprintln!("    Age check: {} >= {} = {}", mr_updated_date, cutoff_date, mr_updated_date >= cutoff_date);
 		
-		if commit_date < cutoff_date {
-			eprintln!("  ❌ SKIPPED: MR {} - commit is older than {} days", mr.iid, max_age_days);
-			eprintln!("    Commit was made on {}, which is before cutoff {}", commit_date, cutoff_date);
+		if mr_updated_date < cutoff_date {
+			eprintln!("  ❌ SKIPPED: MR {} - last updated more than {} days ago", mr.iid, max_age_days);
+			eprintln!("    MR was last updated on {}, which is before cutoff {}", mr_updated_date, cutoff_date);
 			skipped_count += 1;
 			continue;
 		}
-		eprintln!("  ✅ Age check passed (commit is within {} days)", max_age_days);
+		eprintln!("  ✅ Age check passed (MR updated within {} days)", max_age_days);
 		
+		// CRITICAL FIX: Use commit date (with SHA as tie-breaker) to prevent infinite loops
+		// 
+		// PROBLEM: Concourse deduplicates by the entire version object.
+		// If we use MR.updated_at, pipeline comments change it → triggers new build → infinite loop
+		//
+		// SOLUTION: Use commit.committed_date as the timestamp
+		// - Concourse will deduplicate by {iid, committed_date, sha}
+		// - Different MRs with same commit will have different IIDs → both build ✅
+		// - Same MR with same commit won't rebuild (even if comments update MR) ✅
+		// - Same MR with NEW commit (force push) will rebuild (different SHA) ✅
+		//
+		// How this handles the original issue (MR #2726 with old commit):
+		// - MR #2726 has iid="2726", committed_date="2025-09-17", sha="abc123"
+		// - Even if MR #2500 had the same commit date, it has iid="2500" → different version
+		// - Concourse compares full objects: {"iid":"2726",...} ≠ {"iid":"2500",...} → triggers build ✅
 		let version = Version {
 			iid: mr.iid.to_string(),
-			committed_date: commit.committed_date.clone(),
+			committed_date: commit.committed_date.clone(), // ← Use actual commit date
 			sha: mr.sha.clone(),
 		};
 
 		eprintln!("  ✅ INCLUDING MR {} in candidate versions", mr.iid);
-		eprintln!("    MR updated: {}", mr.updated_at);
-		eprintln!("    Commit date: {}", commit.committed_date);
+		eprintln!("    Commit date: {} (used as committed_date)", commit.committed_date);
+		eprintln!("    MR updated: {} (not used - prevents comment loops)", mr.updated_at);
 
 		all_versions.push(version);
 		processed_count += 1;

@@ -23,6 +23,7 @@ use gitlab::api::{
 		repository::commits,
 	},
 	paged,
+	retry::{Backoff, Client as RetryClient},
 	Pagination,
 	Query,
 };
@@ -31,6 +32,7 @@ use glob::Pattern;
 use serde::Deserialize;
 use std::io;
 use std::str::FromStr;
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -44,7 +46,17 @@ fn main() -> Result<()> {
 		get_data_from(&mut io::stdin()).map_err(|err| anyhow!("{}", err.downcast::<serde_json::Error>().unwrap()))?;
 
 	let uri = Url::parse(&input.source.uri)?;
-	let client = Gitlab::new(uri.host_str().unwrap(), &input.source.private_token)?;
+	let gitlab_client = Gitlab::new(uri.host_str().unwrap(), &input.source.private_token)?;
+
+	// Wrap client with retry logic for resilience against transient 5xx errors
+	// Retries 3 times with exponential backoff (1s, 2s, 4s)
+	let backoff = Backoff::builder()
+		.limit(3)
+		.init(Duration::from_secs(1))
+		.scale(2.0)
+		.build()
+		.map_err(|e| anyhow!("Failed to build backoff: {}", e))?;
+	let client = RetryClient::new(gitlab_client, backoff);
 
 	// Calculate the cutoff date for maximum age (default: 90 days / 3 months)
 	let max_age_days = input.source.max_age_days.unwrap_or(90);
@@ -54,6 +66,7 @@ fn main() -> Result<()> {
 	eprintln!("Current time (UTC): {}", Utc::now());
 	eprintln!("Max age days: {}", max_age_days);
 	eprintln!("Cutoff date: {}", cutoff_date);
+	eprintln!("Note: Age filtering is based on commit.committed_date, not MR.updated_at");
 
 	// Determine the starting point for filtering
 	let updated_after = if let Some(version) = &input.version {
@@ -154,24 +167,8 @@ fn main() -> Result<()> {
 		eprintln!("  SHA: {}", mr.sha);
 		eprintln!("  Source branch: {}", mr.source_branch);
 		eprintln!("  Labels: {:?}", mr.labels);
-		// Parse the MR updated date to check if it's within our age limit
-		let mr_updated_at = DateTime::<Utc>::from_str(&mr.updated_at)
-			.map_err(|e| anyhow!("Failed to parse MR updated_at {}: {}", mr.updated_at, e))?;
-
-		eprintln!("  Checking age filter...");
-		eprintln!("    MR updated at: {} (UTC)", mr_updated_at);
-		eprintln!("    Cutoff date: {} (UTC)", cutoff_date);
-		eprintln!("    Age check: {} > {} = {}", mr_updated_at, cutoff_date, mr_updated_at >= cutoff_date);
-
-		// Skip MRs that are too old
-		if mr_updated_at < cutoff_date {
-			eprintln!("  ❌ SKIPPED: MR {} is older than {} days", mr.iid, max_age_days);
-			skipped_count += 1;
-			continue;
-		}
-		eprintln!("  ✅ Age check passed");
-
-		// Apply path filtering if specified
+		
+		// Apply path filtering if specified (before fetching commit to save API calls)
 		if let Some(paths) = &input.source.paths {
 			eprintln!("  Checking path filter...");
 			eprintln!("    Required path patterns: {:?}", paths);
@@ -225,6 +222,25 @@ fn main() -> Result<()> {
 		eprintln!("  Commit details:");
 		eprintln!("    Committed date: {}", commit.committed_date);
 		
+		// Handles Edge Case EC-5: Age filtering on commit date (not MR metadata update time)
+		// This ensures we filter by when code was actually committed, not when MR was last updated
+		// (e.g., comments, labels changes don't make an old commit "new")
+		let commit_date = DateTime::<Utc>::from_str(&commit.committed_date)
+			.map_err(|e| anyhow!("Failed to parse commit committed_date {}: {}", commit.committed_date, e))?;
+		
+		eprintln!("  Checking commit age filter...");
+		eprintln!("    Commit date: {} (UTC)", commit_date);
+		eprintln!("    Cutoff date: {} (UTC)", cutoff_date);
+		eprintln!("    Age check: {} >= {} = {}", commit_date, cutoff_date, commit_date >= cutoff_date);
+		
+		if commit_date < cutoff_date {
+			eprintln!("  ❌ SKIPPED: MR {} - commit is older than {} days", mr.iid, max_age_days);
+			eprintln!("    Commit was made on {}, which is before cutoff {}", commit_date, cutoff_date);
+			skipped_count += 1;
+			continue;
+		}
+		eprintln!("  ✅ Age check passed (commit is within {} days)", max_age_days);
+		
 		let version = Version {
 			iid: mr.iid.to_string(),
 			committed_date: commit.committed_date.clone(),
@@ -255,14 +271,13 @@ fn main() -> Result<()> {
 			i + 1, version.iid, version.committed_date, version.sha);
 	}
 
-	// If we have a previous version, only return versions newer than it
+	// If we have a previous version, filter versions appropriately
 	let filtered_versions = if let Some(current_version) = &input.version {
-		eprintln!("\nFiltering versions newer than current version:");
+		eprintln!("\nFiltering versions relative to current version:");
 		eprintln!("Current version committed_date: {}", current_version.committed_date);
 		eprintln!("Current version iid: {}", current_version.iid);
 		
 		let mut newer_versions = Vec::new();
-		let mut found_bulk_mrs = false;
 		
 		for version in all_versions.into_iter() {
 			// Parse both dates to UTC for proper timezone-aware comparison
@@ -273,24 +288,15 @@ fn main() -> Result<()> {
 			let is_different_mr = version.iid != current_version.iid;
 			let is_current_mr = version.iid == current_version.iid;
 			
-			// Calculate time window for bulk MR detection
-			let time_diff_minutes = (current_dt.timestamp() - candidate_dt.timestamp()) / 60;
-			let within_bulk_window = (0..=10).contains(&time_diff_minutes);
-			
 			// Include MR if:
-			// 1. Newer commit time (obvious case)
-			// 2. Same commit time AND different MR (crossplane case - same SHA)
-			// 3. Within 10-minute window AND different MR (external-dns case - bulk creation)
-			// 4. Is the current MR itself (Concourse expects this to be included)
-			let is_newer_or_different_mr = is_newer 
-				|| (is_same_time && is_different_mr)
-				|| (within_bulk_window && is_different_mr)
-				|| is_current_mr;
-			
-			// Track if we found bulk MRs (older MRs within window)
-			if within_bulk_window && is_different_mr && !is_newer && !is_same_time {
-				found_bulk_mrs = true;
-			}
+			// 1. Is the current MR itself (Concourse contract - always include current)
+			// 2. Newer commit time (obvious case - new commits pushed)
+			// 3. Different MR with commit within 30 days of current (new/reopened MRs, cherry-picks)
+			//    - Rationale: If GitLab returned it via updated_after, MR was recently updated
+			//    - But avoid including MRs with very old commits (>30 days) to prevent false positives
+			let time_diff_days = (current_dt.timestamp() - candidate_dt.timestamp()).abs() / (24 * 60 * 60);
+			let within_large_window = time_diff_days < 90;  // 90 days window (same as age cutoff)
+			let should_include = is_current_mr || is_newer || (is_different_mr && within_large_window);
 			
 			eprintln!("  Checking MR #{}: {} ({}) vs {} ({})", 
 				version.iid,
@@ -301,31 +307,20 @@ fn main() -> Result<()> {
 			);
 			eprintln!("    is_newer: {}, is_same_time: {}, is_different_mr: {}, is_current_mr: {}", 
 				is_newer, is_same_time, is_different_mr, is_current_mr);
-			eprintln!("    time_diff_minutes: {}, within_bulk_window: {}", 
-				time_diff_minutes, within_bulk_window);
 			
-			if is_newer_or_different_mr {
+			if should_include {
 				if is_current_mr {
 					eprintln!("    ✅ INCLUDED: Current version (required by Concourse)");
 				} else if is_newer {
-					eprintln!("    ✅ INCLUDED: Newer than current version");
-				} else if is_same_time {
-					eprintln!("    ✅ INCLUDED: Same commit time but different MR (same SHA scenario)");
+					eprintln!("    ✅ INCLUDED: Newer commit than current version");
 				} else {
-					eprintln!("    ✅ INCLUDED: Within bulk creation window (created within 10 minutes)");
+					eprintln!("    ✅ INCLUDED: Different MR that passed API updated_after filter");
 				}
 				newer_versions.push(version);
 			} else {
-				eprintln!("    ❌ EXCLUDED: Not newer and not within bulk window, and not current MR");
+				// This should never happen with current logic
+				eprintln!("    ❌ EXCLUDED: Logic error - should not reach here");
 			}
-		}
-		
-		// If we found bulk MRs, log a warning about the reprocessing
-		if found_bulk_mrs {
-			eprintln!("\n⚠️  BULK MR DETECTION: Found MRs created within 10-minute window");
-			eprintln!("    This indicates bulk MR creation that was processed out of order.");
-			eprintln!("    Returning all MRs in chronological order for Concourse to reprocess.");
-			eprintln!("    This is similar to a 'force push' scenario in git resources.");
 		}
 		
 		// SMART MR-AWARE FILTERING:
@@ -404,3 +399,7 @@ fn main() -> Result<()> {
 
 	Ok(())
 }
+
+#[cfg(test)]
+mod check_tests;
+

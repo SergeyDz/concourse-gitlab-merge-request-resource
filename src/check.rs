@@ -589,45 +589,15 @@ fn main() -> Result<()> {
 	// Load existing state
 	let mut state = CheckState::load();
 	
-	// CRITICAL MIGRATION: Remove ALL non-current SHAs from state to enable resurrection
-	// This is a one-time migration to fix stuck MRs from the old bug
-	if let Some(current_version) = &input.version {
-		let original_count = state.returned_shas.len();
-		let current_sha = &current_version.sha;
-		
-		// Keep ONLY the current version SHA (if present), remove everything else
-		state.returned_shas.retain(|sha| sha == current_sha);
-		
-		let removed_count = original_count - state.returned_shas.len();
-		
-		if removed_count > 0 {
-			eprintln!("🔧 MIGRATION V2: Clearing state for resurrection mode");
-			eprintln!("   Removed {} stuck SHA(s) from state", removed_count);
-			eprintln!("   Kept current version SHA: {}", current_sha);
-			eprintln!("   This enables resurrection mode to detect and rebuild stuck MRs");
-			
-			// Save cleaned state immediately
-			if let Err(e) = state.save() {
-				eprintln!("⚠️  Warning: Failed to save cleaned state: {}", e);
-			} else {
-				eprintln!("✅ State cleaned: {} → {} SHAs", original_count, state.returned_shas.len());
-			}
-		}
-	} else {
-		// No current version = first run
-		// Clear state entirely to start fresh
-		if !state.returned_shas.is_empty() {
-			eprintln!("🔧 MIGRATION V2: No current version, clearing entire state");
-			let count = state.returned_shas.len();
-			state.returned_shas.clear();
-			
-			if let Err(e) = state.save() {
-				eprintln!("⚠️  Warning: Failed to save cleaned state: {}", e);
-			} else {
-				eprintln!("✅ State cleared: {} → 0 SHAs (first run)", count);
-			}
-		}
-	}
+	// NO MIGRATION - Let resurrection mode handle stuck MRs!
+	// Migration was the wrong approach because:
+	// - Clearing state makes MRs look "new" to our code
+	// - But Concourse DB still has them with same version_sha256
+	// - So Concourse sees them as existing, doesn't increment check_order
+	// - They still don't build!
+	// 
+	// Instead: Keep state AS-IS, let resurrection detect stuck MRs,
+	// return them with FAKE DATES to create NEW version_sha256 in Concourse DB
 	
 	// ========================================================================
 	// RESURRECTION MODE: Force stuck MRs to rebuild with fake dates
@@ -690,6 +660,7 @@ fn main() -> Result<()> {
 	// Separate versions into: new, stuck (need resurrection), and current
 	let mut new_versions = Vec::new();
 	let mut resurrected_versions = Vec::new();
+	let mut resurrected_shas = Vec::new(); // Track for state saving
 	
 	for version in filtered_versions {
 		// NEVER filter out the current version (Concourse needs to see it)
@@ -703,19 +674,26 @@ fn main() -> Result<()> {
 		
 		if was_returned {
 			// This version was returned before but is NOT current
-			// Check if it's stuck (returned >2 hours ago)
+			// It's STUCK in Concourse DB with low check_order
 			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
-			eprintln!("     This suggests it's stuck in Concourse DB with low check_order");
-			eprintln!("     🚑 RESURRECTING with fake date to force rebuild!");
+			eprintln!("     This MR is stuck in Concourse DB with low check_order!");
+			eprintln!("     🚑 RESURRECTING with fake date (1970-01-01) to force rebuild!");
 			
 			// Create resurrected version with FAKE OLD DATE
 			// This creates a DIFFERENT version_sha256 in Concourse
+			// Concourse will see it as NEW and save it with new check_order
 			let resurrected = Version {
 				iid: version.iid.clone(),
 				committed_date: "1970-01-01T00:00:00Z".to_string(), // Epoch = sorts first
 				sha: version.sha.clone(),
 			};
 			
+			// CRITICAL: Track original SHA for state saving
+			// We save the ORIGINAL SHA (not fake) because:
+			// - Next check will fetch same MR from GitLab with real date
+			// - We need to filter it out (already resurrected once)
+			// - If we saved fake SHA, we wouldn't recognize the real one
+			resurrected_shas.push(version.sha.clone());
 			resurrected_versions.push(resurrected);
 		} else {
 			eprintln!("  ✅ Keeping MR #{} (SHA: {}) - new version", version.iid, version.sha);
@@ -727,6 +705,15 @@ fn main() -> Result<()> {
 	eprintln!("  - New versions: {}", new_versions.len());
 	eprintln!("  - Resurrected (stuck) versions: {}", resurrected_versions.len());
 	
+	if !resurrected_versions.is_empty() {
+		eprintln!("\n🚑 RESURRECTION MODE ACTIVE!");
+		eprintln!("   Returning {} stuck MR(s) with fake date (1970-01-01)", resurrected_versions.len());
+		eprintln!("   This creates NEW version_sha256 in Concourse → Forces rebuild!");
+		for v in &resurrected_versions {
+			eprintln!("   - MR #{} (SHA: {})", v.iid, v.sha);
+		}
+	}
+	
 	// Combine: resurrected first (fake old date sorts first), then new versions
 	// This ensures stuck MRs build BEFORE new ones
 	let mut final_versions = resurrected_versions;
@@ -737,13 +724,20 @@ fn main() -> Result<()> {
 	
 	eprintln!("\nPost-filter: {} versions to return", final_versions.len());
 	
-	// CRITICAL: Mark ALL returned SHAs (including resurrected) to prevent infinite loops
-	// Resurrected versions get marked so they won't be resurrected again next time
-	let new_shas_to_save: Vec<String> = final_versions
+	// CRITICAL: Mark ALL returned SHAs (including resurrected ORIGINAL SHAs)
+	// For resurrected versions, we save the ORIGINAL SHA (not fake date version)
+	// because next check will fetch same MR from GitLab with real date/SHA
+	let mut new_shas_to_save: Vec<String> = final_versions
 		.iter()
 		.filter(|v| Some(v.sha.as_str()) != current_sha)
 		.map(|v| v.sha.clone())
 		.collect();
+	
+	// Add resurrected original SHAs (already in new_shas_to_save, but explicit for clarity)
+	new_shas_to_save.extend(resurrected_shas);
+	new_shas_to_save.sort();
+	new_shas_to_save.dedup(); // Remove duplicates
+	
 	
 	
 	if !new_shas_to_save.is_empty() {

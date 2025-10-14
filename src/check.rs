@@ -589,36 +589,80 @@ fn main() -> Result<()> {
 	// Load existing state
 	let mut state = CheckState::load();
 	
+	// CRITICAL FIX FOR MIGRATION: Remove current version from state if present
+	// This handles the case where old code saved the current version to state
+	if let Some(current_version) = &input.version {
+		if state.returned_shas.contains(&current_version.sha) {
+			eprintln!("🔧 MIGRATION: Removing current version SHA {} from state (old bug)", current_version.sha);
+			eprintln!("   This is a one-time cleanup from previous version that incorrectly saved current version.");
+			state.returned_shas.remove(&current_version.sha);
+			
+			// Save cleaned state immediately
+			if let Err(e) = state.save() {
+				eprintln!("⚠️  Warning: Failed to save cleaned state: {}", e);
+			} else {
+				eprintln!("✅ State cleaned and saved");
+			}
+		}
+	}
+	
 	eprintln!("Pre-filter: {} versions, {} already returned", 
 		filtered_versions.len(), 
 		state.returned_shas.len()
 	);
 	
-	// Filter out versions that were already returned
+	// CRITICAL FIX: Identify which versions are truly NEW (excluding current version)
+	// We should NEVER save the current version to state, because:
+	// 1. Concourse already has it (it's the "current" version)
+	// 2. Future checks need to see it to determine what's newer
+	// 3. Filtering it out breaks Concourse's scheduler
+	let current_sha = input.version.as_ref().map(|v| v.sha.as_str());
+	
+	// Filter out versions that were already returned (but keep current if present)
 	let new_versions: Vec<Version> = filtered_versions
 		.into_iter()
 		.filter(|v| {
+			// NEVER filter out the current version (Concourse needs to see it)
+			if Some(v.sha.as_str()) == current_sha {
+				eprintln!("  ⭐ Keeping MR #{} (SHA: {}) - current version (required by Concourse)", v.iid, v.sha);
+				return true;
+			}
+			
 			let was_returned = state.was_returned(&v.sha);
 			if was_returned {
 				eprintln!("  🚫 Filtering out MR #{} (SHA: {}) - already returned", v.iid, v.sha);
+				false
 			} else {
 				eprintln!("  ✅ Keeping MR #{} (SHA: {}) - new version", v.iid, v.sha);
+				true
 			}
-			!was_returned
 		})
 		.collect();
 	
-	eprintln!("\nPost-filter: {} new versions to return", new_versions.len());
+	eprintln!("\nPost-filter: {} versions to return", new_versions.len());
 	
-	// Update state with new versions
-	for version in &new_versions {
-		state.mark_returned(version.sha.clone());
-	}
+	// CRITICAL: Only mark NEW versions as returned (NOT the current version)
+	// This prevents filtering out the current version on subsequent checks
+	let new_shas_to_save: Vec<String> = new_versions
+		.iter()
+		.filter(|v| Some(v.sha.as_str()) != current_sha)
+		.map(|v| v.sha.clone())
+		.collect();
 	
-	// Save state (non-fatal if fails)
-	if let Err(e) = state.save() {
-		eprintln!("⚠️  Warning: Failed to save state: {}", e);
-		eprintln!("   This is non-fatal, but next check may return duplicate versions.");
+	if !new_shas_to_save.is_empty() {
+		eprintln!("Marking {} new SHAs as returned (excluding current version):", new_shas_to_save.len());
+		for sha in &new_shas_to_save {
+			eprintln!("  - {}", sha);
+			state.mark_returned(sha.clone());
+		}
+		
+		// Save state (non-fatal if fails)
+		if let Err(e) = state.save() {
+			eprintln!("⚠️  Warning: Failed to save state: {}", e);
+			eprintln!("   This is non-fatal, but next check may return duplicate versions.");
+		}
+	} else {
+		eprintln!("No new SHAs to save to state (only returning current version or empty)");
 	}
 	
 	eprintln!("\n=== FINAL RESULT ===");

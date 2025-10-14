@@ -278,7 +278,6 @@ fn main() -> Result<()> {
 		eprintln!("Current version iid: {}", current_version.iid);
 		
 		let mut newer_versions = Vec::new();
-		let mut found_bulk_mrs = false;
 		
 		for version in all_versions.into_iter() {
 			// Parse both dates to UTC for proper timezone-aware comparison
@@ -289,29 +288,15 @@ fn main() -> Result<()> {
 			let is_different_mr = version.iid != current_version.iid;
 			let is_current_mr = version.iid == current_version.iid;
 			
-			// Calculate time window for bulk MR detection
-			let time_diff_minutes = (current_dt.timestamp() - candidate_dt.timestamp()) / 60;
-			let within_bulk_window = (0..=10).contains(&time_diff_minutes);
-			
 			// Include MR if:
-			// 1. Newer commit time (obvious case - new commits pushed)
-			// 2. Same commit time AND different MR (crossplane case - same SHA across branches)
-			// 3. Within 10-minute window AND different MR (external-dns case - bulk creation)
-			// 4. Is the current MR itself (Concourse contract - always include current)
-			// 5. Is a different MR that passed updated_after filter (new/reopened MR case)
-			//    NOTE: If GitLab API returned this MR via updated_after filter, it means the MR
-			//    was recently updated/created, so we should build it even if commit is old
-			//    (handles case: new MR with cherry-picked/rebased old commit)
-			let should_include = is_newer 
-				|| (is_same_time && is_different_mr)
-				|| (within_bulk_window && is_different_mr)
-				|| is_current_mr
-				|| is_different_mr; // ← NEW: Include any different MR that passed API filter
-			
-			// Track if we found bulk MRs (older MRs within window)
-			if within_bulk_window && is_different_mr && !is_newer && !is_same_time {
-				found_bulk_mrs = true;
-			}
+			// 1. Is the current MR itself (Concourse contract - always include current)
+			// 2. Newer commit time (obvious case - new commits pushed)
+			// 3. Different MR with commit within 30 days of current (new/reopened MRs, cherry-picks)
+			//    - Rationale: If GitLab returned it via updated_after, MR was recently updated
+			//    - But avoid including MRs with very old commits (>30 days) to prevent false positives
+			let time_diff_days = (current_dt.timestamp() - candidate_dt.timestamp()).abs() / (24 * 60 * 60);
+			let within_large_window = time_diff_days < 90;  // 90 days window (same as age cutoff)
+			let should_include = is_current_mr || is_newer || (is_different_mr && within_large_window);
 			
 			eprintln!("  Checking MR #{}: {} ({}) vs {} ({})", 
 				version.iid,
@@ -322,34 +307,20 @@ fn main() -> Result<()> {
 			);
 			eprintln!("    is_newer: {}, is_same_time: {}, is_different_mr: {}, is_current_mr: {}", 
 				is_newer, is_same_time, is_different_mr, is_current_mr);
-			eprintln!("    time_diff_minutes: {}, within_bulk_window: {}", 
-				time_diff_minutes, within_bulk_window);
 			
 			if should_include {
 				if is_current_mr {
 					eprintln!("    ✅ INCLUDED: Current version (required by Concourse)");
 				} else if is_newer {
 					eprintln!("    ✅ INCLUDED: Newer commit than current version");
-				} else if is_same_time {
-					eprintln!("    ✅ INCLUDED: Same commit time but different MR (same SHA scenario)");
-				} else if within_bulk_window {
-					eprintln!("    ✅ INCLUDED: Within bulk creation window (created within 10 minutes)");
 				} else {
-					eprintln!("    ✅ INCLUDED: Different MR that passed API updated_after filter (new/reopened MR)");
+					eprintln!("    ✅ INCLUDED: Different MR that passed API updated_after filter");
 				}
 				newer_versions.push(version);
 			} else {
-				// This should never happen now since is_different_mr is always true if not current MR
+				// This should never happen with current logic
 				eprintln!("    ❌ EXCLUDED: Logic error - should not reach here");
 			}
-		}
-		
-		// If we found bulk MRs, log a warning about the reprocessing
-		if found_bulk_mrs {
-			eprintln!("\n⚠️  BULK MR DETECTION: Found MRs created within 10-minute window");
-			eprintln!("    This indicates bulk MR creation that was processed out of order.");
-			eprintln!("    Returning all MRs in chronological order for Concourse to reprocess.");
-			eprintln!("    This is similar to a 'force push' scenario in git resources.");
 		}
 		
 		// SMART MR-AWARE FILTERING:
@@ -428,3 +399,7 @@ fn main() -> Result<()> {
 
 	Ok(())
 }
+
+#[cfg(test)]
+mod check_tests;
+

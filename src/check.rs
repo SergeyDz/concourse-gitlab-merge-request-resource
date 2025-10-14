@@ -610,10 +610,11 @@ fn main() -> Result<()> {
 	// 
 	// **THE SOLUTION**:
 	// Detect MRs that were returned >2 hours ago but never built.
-	// Return them with FAKE OLD DATE (1970-01-01) to trick Concourse:
+	// Return them with FAKE FUTURE DATE (2099-12-31) to trick Concourse:
 	// - Different committed_date → Different SHA256 → NEW version
-	// - Very old date → Sorts first in list → Gets lowest check_order
-	// - Concourse sees as new → Saves to DB → BUILDS! ✅
+	// - Future date → Sorts last → Gets HIGHEST check_order
+	// - Concourse's NextEveryVersion uses ORDER BY check_order ASC
+	// - So highest check_order = builds FIRST! ✅
 	// 
 	// **DETECTION LOGIC**:
 	// If a version:
@@ -677,14 +678,16 @@ fn main() -> Result<()> {
 			// It's STUCK in Concourse DB with low check_order
 			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
 			eprintln!("     This MR is stuck in Concourse DB with low check_order!");
-			eprintln!("     🚑 RESURRECTING with fake date (1970-01-01) to force rebuild!");
+			eprintln!("     🚑 RESURRECTING with fake date (2099-12-31) to force rebuild!");
 			
-			// Create resurrected version with FAKE OLD DATE
+			// Create resurrected version with FAKE FUTURE DATE
 			// This creates a DIFFERENT version_sha256 in Concourse
-			// Concourse will see it as NEW and save it with new check_order
+			// Concourse will see it as NEW and save it with HIGH check_order
+			// CRITICAL: Future date = highest check_order = builds FIRST
+			// (Concourse's NextEveryVersion uses ORDER BY check_order ASC)
 			let resurrected = Version {
 				iid: version.iid.clone(),
-				committed_date: "1970-01-01T00:00:00Z".to_string(), // Epoch = sorts first
+				committed_date: "2099-12-31T23:59:59Z".to_string(), // Future = sorts last = highest check_order
 				sha: version.sha.clone(),
 			};
 			
@@ -707,8 +710,9 @@ fn main() -> Result<()> {
 	
 	if !resurrected_versions.is_empty() {
 		eprintln!("\n🚑 RESURRECTION MODE ACTIVE!");
-		eprintln!("   Returning {} stuck MR(s) with fake date (1970-01-01)", resurrected_versions.len());
+		eprintln!("   Returning {} stuck MR(s) with fake date (2099-12-31)", resurrected_versions.len());
 		eprintln!("   This creates NEW version_sha256 in Concourse → Forces rebuild!");
+		eprintln!("   IMPORTANT: Future date = highest check_order = builds FIRST!");
 		for v in &resurrected_versions {
 			eprintln!("   - MR #{} (SHA: {})", v.iid, v.sha);
 		}
@@ -771,7 +775,7 @@ fn main() -> Result<()> {
 	} else {
 		eprintln!("📬 RETURNING VERSIONS:");
 		for (i, version) in final_versions.iter().enumerate() {
-			let is_resurrected = version.committed_date == "1970-01-01T00:00:00Z";
+			let is_resurrected = version.committed_date == "2099-12-31T23:59:59Z";
 			let marker = if is_resurrected { "🚑 RESURRECTED" } else { "✅ NEW" };
 			eprintln!("  {}. {} - MR #{} - committed: {} - SHA: {}", 
 				i + 1, marker, version.iid, version.committed_date, version.sha);

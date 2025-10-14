@@ -48,12 +48,12 @@ mod check_filtering_tests {
             let current_dt = DateTime::<Utc>::from_str(&current_version.committed_date).unwrap();
             
             let is_newer = candidate_dt > current_dt;
-            let is_same_time = candidate_dt == current_dt;
+            let _is_same_time = candidate_dt == current_dt;
             let is_different_mr = version.iid != current_version.iid;
             let is_current_mr = version.iid == current_version.iid;
             
             let time_diff_minutes = (current_dt.timestamp() - candidate_dt.timestamp()) / 60;
-            let within_bulk_window = (0..=10).contains(&time_diff_minutes);
+            let _within_bulk_window = (0..=10).contains(&time_diff_minutes);
             
             // Updated logic: Include current MR, newer commits, or different MRs within reasonable time window
             // This fixes the user's case (new MR with 27-day-old commit) while avoiding including very old commits
@@ -112,14 +112,16 @@ mod check_filtering_tests {
     }
     
     #[test]
-    fn test_a2_mr_older_than_current() {
+    fn test_a2_mr_older_than_current_included() {
         let current = make_version(10, -30, "abc123");  // 30 min ago
         let older = make_version(20, -60, "def456");    // 1 hour ago (older)
         
         let result = filter_versions(vec![older.clone()], Some(&current));
         
-        assert_eq!(result.len(), 1);  // only current (older MR excluded - too old)
-        assert_eq!(result[0], current);
+        // With new logic: include different MRs if within 90-day window
+        assert_eq!(result.len(), 2);  // current + older MR (within window)
+        assert!(result.iter().any(|v| v.iid == "10"));
+        assert!(result.iter().any(|v| v.iid == "20"));
     }
     
     #[test]
@@ -161,14 +163,16 @@ mod check_filtering_tests {
     }
     
     #[test]
-    fn test_a6_mr_outside_10min_bulk_window() {
+    fn test_a6_mr_outside_10min_bulk_window_included() {
         let current = make_version(100, -60, "current");  // 60 min ago
         let old_mr = make_version(50, -80, "old");        // 80 min ago (20 min before current)
         
         let result = filter_versions(vec![old_mr.clone()], Some(&current));
         
-        assert_eq!(result.len(), 1);  // only current
-        assert_eq!(result[0], current);
+        // With new logic: include different MRs within 90-day window
+        assert_eq!(result.len(), 2);  // old MR + current
+        assert!(result.iter().any(|v| v.iid == "50"));
+        assert!(result.iter().any(|v| v.iid == "100"));
     }
     
     #[test]
@@ -220,8 +224,11 @@ mod check_filtering_tests {
         // Note: Age filtering happens before this function, but testing time comparison
         let result = filter_versions(vec![day_89.clone(), day_91.clone()], Some(&current));
         
-        // Both older than current, outside bulk window
-        assert_eq!(result.len(), 1);  // Only current
+        // With new logic: include MRs within 90-day window
+        assert_eq!(result.len(), 2);  // current + day_89 (within window), day_91 excluded
+        assert!(result.iter().any(|v| v.iid == "1"));
+        assert!(result.iter().any(|v| v.iid == "89"));
+        assert!(!result.iter().any(|v| v.iid == "91"));
     }
     
     // ============================================================================
@@ -279,29 +286,29 @@ mod check_filtering_tests {
     #[test]
     fn test_b4_five_mrs_multiple_commits_each() {
         let current = make_version(100, -200, "current");
-        let mut all_commits = vec![];
-        
-        // MR 77: 3 commits
-        all_commits.push(make_version_at(77, "2025-10-09T10:00:00+00:00", "77a"));
-        all_commits.push(make_version_at(77, "2025-10-09T10:05:00+00:00", "77b"));
-        all_commits.push(make_version_at(77, "2025-10-09T10:10:00+00:00", "77c"));
-        
-        // MR 78: 2 commits
-        all_commits.push(make_version_at(78, "2025-10-09T10:15:00+00:00", "78a"));
-        all_commits.push(make_version_at(78, "2025-10-09T10:20:00+00:00", "78b"));
-        
-        // MR 79: 1 commit
-        all_commits.push(make_version_at(79, "2025-10-09T10:25:00+00:00", "79a"));
-        
-        // MR 80: 4 commits
-        all_commits.push(make_version_at(80, "2025-10-09T10:30:00+00:00", "80a"));
-        all_commits.push(make_version_at(80, "2025-10-09T10:35:00+00:00", "80b"));
-        all_commits.push(make_version_at(80, "2025-10-09T10:40:00+00:00", "80c"));
-        all_commits.push(make_version_at(80, "2025-10-09T10:45:00+00:00", "80d"));
-        
-        // MR 81: 2 commits
-        all_commits.push(make_version_at(81, "2025-10-09T10:50:00+00:00", "81a"));
-        all_commits.push(make_version_at(81, "2025-10-09T10:55:00+00:00", "81b"));
+        let all_commits = vec![
+            // MR 77: 3 commits
+            make_version_at(77, "2025-10-09T10:00:00+00:00", "77a"),
+            make_version_at(77, "2025-10-09T10:05:00+00:00", "77b"),
+            make_version_at(77, "2025-10-09T10:10:00+00:00", "77c"),
+            
+            // MR 78: 2 commits
+            make_version_at(78, "2025-10-09T10:15:00+00:00", "78a"),
+            make_version_at(78, "2025-10-09T10:20:00+00:00", "78b"),
+            
+            // MR 79: 1 commit
+            make_version_at(79, "2025-10-09T10:25:00+00:00", "79a"),
+            
+            // MR 80: 4 commits
+            make_version_at(80, "2025-10-09T10:30:00+00:00", "80a"),
+            make_version_at(80, "2025-10-09T10:35:00+00:00", "80b"),
+            make_version_at(80, "2025-10-09T10:40:00+00:00", "80c"),
+            make_version_at(80, "2025-10-09T10:45:00+00:00", "80d"),
+            
+            // MR 81: 2 commits
+            make_version_at(81, "2025-10-09T10:50:00+00:00", "81a"),
+            make_version_at(81, "2025-10-09T10:55:00+00:00", "81b"),
+        ];
         
         let result = filter_versions(all_commits, Some(&current));
         
@@ -316,14 +323,16 @@ mod check_filtering_tests {
     }
     
     #[test]
-    fn test_b5_mr_with_older_commit_excluded() {
+    fn test_b5_mr_with_older_commit_included() {
         let current = make_version(50, -30, "current");  // 30 min ago
         let older = make_version(60, -120, "old");       // 2 hours ago
         
         let result = filter_versions(vec![older], Some(&current));
         
-        assert_eq!(result.len(), 1);  // Only current
-        assert_eq!(result[0].iid, "50");
+        // With new logic: include different MRs within 90-day window
+        assert_eq!(result.len(), 2);  // current + older MR
+        assert!(result.iter().any(|v| v.iid == "50"));
+        assert!(result.iter().any(|v| v.iid == "60"));
     }
     
     #[test]
@@ -417,11 +426,9 @@ mod check_filtering_tests {
         
         let result = filter_versions(all_commits, Some(&current));
         
-        // MRs 1-49 are newer than current (offsets -10 to -499)
-        // MR 50 is at -500 to -504 (within bulk window of current at -500)
-        // MRs 51-200 are older and outside window
-        // Expected: ~50-52 MRs (latest each) + current if not already included
-        assert!(result.len() >= 50 && result.len() <= 53, "Expected 50-53, got {}", result.len());
+        // With new logic: include all different MRs within 90-day window
+        // All 200 MRs are within 90 days, so all should be included (latest commit per MR)
+        assert_eq!(result.len(), 201);  // 200 MRs (latest each) + current
         
         // Verify no duplicates
         let mut seen_iids = std::collections::HashSet::new();
@@ -492,15 +499,18 @@ mod check_filtering_tests {
     }
     
     #[test]
-    fn test_c5_same_sha_all_older_than_current() {
+    fn test_c5_same_sha_all_older_than_current_included() {
         let current = make_version(100, -10, "current");  // Recent
         let old1 = make_version_at(50, "2025-10-08T10:00:00+00:00", "old_sha");
         let old2 = make_version_at(60, "2025-10-08T10:00:00+00:00", "old_sha");
         
         let result = filter_versions(vec![old1, old2], Some(&current));
         
-        assert_eq!(result.len(), 1);  // Only current (others too old)
-        assert_eq!(result[0].iid, "100");
+        // With new logic: include different MRs within 90-day window (~6 days difference)
+        assert_eq!(result.len(), 3);  // current + 2 older MRs
+        assert!(result.iter().any(|v| v.iid == "50"));
+        assert!(result.iter().any(|v| v.iid == "60"));
+        assert!(result.iter().any(|v| v.iid == "100"));
     }
     
     // ============================================================================
@@ -542,12 +552,12 @@ mod check_filtering_tests {
     }
     
     #[test]
-    fn test_d3_five_mrs_within_11_minutes() {
+    fn test_d3_five_mrs_within_11_minutes_all_included() {
         let current = make_version_at(100, "2025-10-09T10:00:00+00:00", "current");
         
         let bulk_mrs = vec![
-            make_version_at(77, "2025-10-09T09:49:00+00:00", "77"),  // 11 min before (outside)
-            make_version_at(78, "2025-10-09T09:52:00+00:00", "78"),  // 8 min before (inside)
+            make_version_at(77, "2025-10-09T09:49:00+00:00", "77"),  // 11 min before
+            make_version_at(78, "2025-10-09T09:52:00+00:00", "78"),  // 8 min before
             make_version_at(79, "2025-10-09T09:54:00+00:00", "79"),
             make_version_at(80, "2025-10-09T09:56:00+00:00", "80"),
             make_version_at(81, "2025-10-09T09:58:00+00:00", "81"),
@@ -555,12 +565,18 @@ mod check_filtering_tests {
         
         let result = filter_versions(bulk_mrs, Some(&current));
         
-        assert_eq!(result.len(), 5);  // 4 within window + current (77 excluded)
-        assert!(!result.iter().any(|v| v.iid == "77"));
+        // With new logic: include all different MRs within 90-day window
+        assert_eq!(result.len(), 6);  // All 5 MRs + current
+        assert!(result.iter().any(|v| v.iid == "77"));
+        assert!(result.iter().any(|v| v.iid == "78"));
+        assert!(result.iter().any(|v| v.iid == "79"));
+        assert!(result.iter().any(|v| v.iid == "80"));
+        assert!(result.iter().any(|v| v.iid == "81"));
+        assert!(result.iter().any(|v| v.iid == "100"));
     }
     
     #[test]
-    fn test_d4_ten_mrs_partial_in_window() {
+    fn test_d4_ten_mrs_partial_in_window_all_included() {
         let current = make_version(100, 0, "current");  // Now
         
         let mut mrs = vec![];
@@ -571,9 +587,8 @@ mod check_filtering_tests {
         
         let result = filter_versions(mrs, Some(&current));
         
-        // MRs 6-10 min ago are within window (bulk window is 0..=10)
-        // Expected: MRs at -6, -7, -8, -9, -10 (5 MRs) + current = 6
-        assert_eq!(result.len(), 6);
+        // With new logic: include all different MRs within 90-day window
+        assert_eq!(result.len(), 11);  // All 10 MRs + current
     }
     
     #[test]
@@ -620,21 +635,25 @@ mod check_filtering_tests {
     }
     
     #[test]
-    fn test_d8_bulk_spanning_window() {
+    fn test_d8_bulk_spanning_window_all_included() {
         let current = make_version_at(100, "2025-10-09T10:00:00+00:00", "current");
         
         let mixed = vec![
-            make_version_at(70, "2025-10-09T09:30:00+00:00", "old"),    // Outside
-            make_version_at(75, "2025-10-09T09:55:00+00:00", "bulk1"),  // Inside
-            make_version_at(80, "2025-10-09T09:58:00+00:00", "bulk2"),  // Inside
-            make_version_at(85, "2025-10-09T10:05:00+00:00", "newer"),  // Newer
+            make_version_at(70, "2025-10-09T09:30:00+00:00", "old"),    // 30 min before
+            make_version_at(75, "2025-10-09T09:55:00+00:00", "bulk1"),  // 5 min before
+            make_version_at(80, "2025-10-09T09:58:00+00:00", "bulk2"),  // 2 min before
+            make_version_at(85, "2025-10-09T10:05:00+00:00", "newer"),  // 5 min after
         ];
         
         let result = filter_versions(mixed, Some(&current));
         
-        // bulk1, bulk2, newer, current (old excluded)
-        assert!(result.len() >= 4);
-        assert!(!result.iter().any(|v| v.iid == "70"));
+        // With new logic: include all different MRs within 90-day window
+        assert_eq!(result.len(), 5);  // All 4 MRs + current
+        assert!(result.iter().any(|v| v.iid == "70"));
+        assert!(result.iter().any(|v| v.iid == "75"));
+        assert!(result.iter().any(|v| v.iid == "80"));
+        assert!(result.iter().any(|v| v.iid == "85"));
+        assert!(result.iter().any(|v| v.iid == "100"));
     }
     
     #[test]

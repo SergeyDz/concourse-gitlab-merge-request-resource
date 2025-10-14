@@ -55,12 +55,13 @@ mod check_filtering_tests {
             let time_diff_minutes = (current_dt.timestamp() - candidate_dt.timestamp()) / 60;
             let within_bulk_window = (0..=10).contains(&time_diff_minutes);
             
-            let is_newer_or_different_mr = is_newer 
-                || (is_same_time && is_different_mr)
-                || (within_bulk_window && is_different_mr)
-                || is_current_mr;
+            // Updated logic: Include current MR, newer commits, or different MRs within reasonable time window
+            // This fixes the user's case (new MR with 27-day-old commit) while avoiding including very old commits
+            let time_diff_days = (current_dt.timestamp() - candidate_dt.timestamp()).abs() / (24 * 60 * 60);
+            let within_large_window = time_diff_days < 90;  // 90 days window (same as age cutoff)
+            let should_include = is_current_mr || is_newer || (is_different_mr && within_large_window);
             
-            if is_newer_or_different_mr {
+            if should_include {
                 newer_versions.push(version);
             }
         }
@@ -117,7 +118,7 @@ mod check_filtering_tests {
         
         let result = filter_versions(vec![older.clone()], Some(&current));
         
-        assert_eq!(result.len(), 1);  // only current
+        assert_eq!(result.len(), 1);  // only current (older MR excluded - too old)
         assert_eq!(result[0], current);
     }
     

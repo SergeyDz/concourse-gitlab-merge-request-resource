@@ -738,6 +738,14 @@ fn main() -> Result<()> {
 		}
 	}
 	
+	// CRITICAL: Track NEW SHAs before moving new_versions
+	// We need to save these to state, but NOT the resurrected ones
+	let new_shas_to_save: Vec<String> = new_versions
+		.iter()
+		.filter(|v| Some(v.sha.as_str()) != current_sha)
+		.map(|v| v.sha.clone())
+		.collect();
+	
 	// Combine: resurrected first (fake old date sorts first), then new versions
 	// This ensures stuck MRs build BEFORE new ones
 	let mut final_versions = resurrected_versions;
@@ -748,21 +756,8 @@ fn main() -> Result<()> {
 	
 	eprintln!("\nPost-filter: {} versions to return", final_versions.len());
 	
-	// CRITICAL: Mark ALL returned SHAs (including resurrected ORIGINAL SHAs)
-	// For resurrected versions, we save the ORIGINAL SHA (not fake date version)
-	// because next check will fetch same MR from GitLab with real date/SHA
-	let mut new_shas_to_save: Vec<String> = final_versions
-		.iter()
-		.filter(|v| Some(v.sha.as_str()) != current_sha)
-		.map(|v| v.sha.clone())
-		.collect();
-	
-	// Add resurrected original SHAs (already in new_shas_to_save, but explicit for clarity)
-	new_shas_to_save.extend(resurrected_shas);
-	new_shas_to_save.sort();
-	new_shas_to_save.dedup(); // Remove duplicates
-	
-	
+	// new_shas_to_save was already computed before moving new_versions (see above)
+	// DO NOT add resurrected_shas - they're already in state!
 	
 	if !new_shas_to_save.is_empty() {
 		eprintln!("Marking {} new SHAs as returned (excluding current version):", new_shas_to_save.len());

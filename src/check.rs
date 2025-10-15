@@ -257,11 +257,15 @@ fn main() -> Result<()> {
 	// Calculate the cutoff date for maximum age (default: 90 days / 3 months)
 	let max_age_days = input.source.max_age_days.unwrap_or(90);
 	let cutoff_date = Utc::now() - chrono::Duration::days(max_age_days as i64);
+	
+	// Calculate the commit date window for version filtering (default: same as max_age_days)
+	let commit_date_window_days = input.source.commit_date_window_days.unwrap_or(max_age_days);
 
 	eprintln!("=== CONCOURSE GITLAB MR RESOURCE DEBUG INFO ===");
 	eprintln!("Current time (UTC): {}", Utc::now());
 	eprintln!("Max age days: {}", max_age_days);
 	eprintln!("Cutoff date: {}", cutoff_date);
+	eprintln!("Commit date window: {} days", commit_date_window_days);
 	eprintln!("Note: Age filtering is based on MR.updated_at, not commit.committed_date");
 	eprintln!("Note: Version deduplication uses {{iid, committed_date, sha}} to prevent comment loops");
 
@@ -461,42 +465,6 @@ fn main() -> Result<()> {
 		}
 		eprintln!("  ✅ Age check passed (MR updated within {} days)", max_age_days);
 		
-		// Check if MR has CI status (optional filter to prevent rebuilding)
-		if input.source.skip_mr_with_ci_status.unwrap_or(false) {
-			eprintln!("  Checking if MR has CI status...");
-			
-			// Query GitLab API for commit statuses using the gitlab crate
-			let statuses_result: Result<Vec<CommitStatus>, _> = paged(
-				CommitStatuses::builder()
-					.project(mr.source_project_id)
-					.commit(&mr.sha)
-					.build()?,
-				Pagination::Limit(1), // We only need to know if ANY status exists
-			)
-			.query(&client);
-			
-			match statuses_result {
-				Ok(statuses) => {
-					if !statuses.is_empty() {
-						let status_info = statuses.iter()
-							.map(|s| format!("{}: {}", s.name.as_ref().unwrap_or(&"unknown".to_string()), s.status))
-							.collect::<Vec<_>>()
-							.join(", ");
-						
-						eprintln!("  ❌ SKIPPED: MR {} - has CI status(es): {}", mr.iid, status_info);
-						eprintln!("    This MR was already built (skip_mr_with_ci_status: true)");
-						skipped_count += 1;
-						continue;
-					} else {
-						eprintln!("    ✅ No CI status found - MR needs building");
-					}
-				},
-				Err(e) => {
-					eprintln!("    ⚠️  Failed to fetch CI statuses: {}, including MR anyway", e);
-				}
-			}
-		}
-		
 		// CRITICAL FIX: Use commit date (with SHA as tie-breaker) to prevent infinite loops
 		// 
 		// PROBLEM: Concourse deduplicates by the entire version object.
@@ -532,6 +500,14 @@ fn main() -> Result<()> {
 	eprintln!("Skipped due to filters: {}", skipped_count);
 	eprintln!("Candidate versions before final filtering: {}", all_versions.len());
 
+	// Create SHA-to-MR mapping for fast lookup during resurrection
+	// This allows us to check CI status only for MRs we're about to resurrect
+	use std::collections::HashMap;
+	let mut sha_to_mr: HashMap<String, &MergeRequest> = HashMap::new();
+	for mr in &mrs {
+		sha_to_mr.insert(mr.sha.clone(), mr);
+	}
+
 	// Sort versions by committed_date ascending (oldest first) for Concourse
 	all_versions.sort_by(|a, b| a.committed_date.cmp(&b.committed_date));
 
@@ -562,11 +538,11 @@ fn main() -> Result<()> {
 			// Include MR if:
 			// 1. Is the current MR itself (Concourse contract - always include current)
 			// 2. Newer commit time (obvious case - new commits pushed)
-			// 3. Different MR with commit within 30 days of current (new/reopened MRs, cherry-picks)
+			// 3. Different MR with commit within window of current (new/reopened MRs, cherry-picks)
 			//    - Rationale: If GitLab returned it via updated_after, MR was recently updated
-			//    - But avoid including MRs with very old commits (>30 days) to prevent false positives
+			//    - But avoid including MRs with very old commits to prevent false positives
 			let time_diff_days = (current_dt.timestamp() - candidate_dt.timestamp()).abs() / (24 * 60 * 60);
-			let within_large_window = time_diff_days < 90;  // 90 days window (same as age cutoff)
+			let within_large_window = time_diff_days < commit_date_window_days as i64;
 			let should_include = is_current_mr || is_newer || (is_different_mr && within_large_window);
 			
 			eprintln!("  Checking MR #{}: {} ({}) vs {} ({})", 
@@ -836,6 +812,50 @@ fn main() -> Result<()> {
 			// It's STUCK in Concourse DB with low check_order
 			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
 			eprintln!("     This MR is stuck in Concourse DB with low check_order!");
+			
+			// OPTIMIZATION: Check CI status ONLY for stuck MRs (not all MRs)
+			// If skip_mr_with_ci_status is enabled, check if this stuck MR already has CI status
+			// If it does, it was already built - no need to resurrect it!
+			if input.source.skip_mr_with_ci_status.unwrap_or(false) {
+				eprintln!("     Checking if stuck MR has CI status before resurrecting...");
+				
+				// Look up the MR to get its source_project_id
+				if let Some(mr) = sha_to_mr.get(&version.sha) {
+					// Query GitLab API for commit statuses
+					let statuses_result: Result<Vec<CommitStatus>, _> = paged(
+						CommitStatuses::builder()
+							.project(mr.source_project_id)
+							.commit(&version.sha)
+							.build()?,
+						Pagination::Limit(1), // We only need to know if ANY status exists
+					)
+					.query(&client);
+					
+					match statuses_result {
+						Ok(statuses) => {
+							if !statuses.is_empty() {
+								let status_info = statuses.iter()
+									.map(|s| format!("{}: {}", s.name.as_ref().unwrap_or(&"unknown".to_string()), s.status))
+									.collect::<Vec<_>>()
+									.join(", ");
+								
+								eprintln!("     ✅ SKIP RESURRECTION: MR #{} already has CI status: {}", version.iid, status_info);
+								eprintln!("        This stuck MR was already built - no need to resurrect!");
+								// Don't resurrect - just skip this version entirely
+								continue;
+							} else {
+								eprintln!("     ⚠️  No CI status found - MR needs resurrection to rebuild");
+							}
+						},
+						Err(e) => {
+							eprintln!("     ⚠️  Failed to fetch CI statuses: {}, resurrecting anyway", e);
+						}
+					}
+				} else {
+					eprintln!("     ⚠️  MR not found in lookup map, resurrecting anyway");
+				}
+			}
+			
 			eprintln!("     🚑 RESURRECTING with current UTC time as fake date to force rebuild!");
 			
 			// Create resurrected version with CURRENT UTC TIME as fake date

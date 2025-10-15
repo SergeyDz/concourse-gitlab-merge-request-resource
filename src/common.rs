@@ -109,7 +109,12 @@ pub struct Source {
 	pub skip_draft: Option<bool>,
 	pub target_branch: Option<String>,
 	/// Maximum age in days for merge requests to be considered (default: 90 days / 3 months)
+	/// This filters based on MR's updated_at date (when the MR was last modified)
 	pub max_age_days: Option<u32>,
+	/// Maximum commit age window in days for version filtering (default: same as max_age_days)
+	/// When comparing versions, include MRs with commits within this many days of current version.
+	/// This filters based on commit's committed_date (when the code was committed)
+	pub commit_date_window_days: Option<u32>,
 	/// Skip MRs where the last commit has any CI status (prevents rebuilding already-built MRs)
 	pub skip_mr_with_ci_status: Option<bool>,
 }
@@ -156,6 +161,7 @@ mod tests {
 					skip_draft: None,
 					target_branch: None,
 					max_age_days: None,
+					commit_date_window_days: None,
 					skip_mr_with_ci_status: None,
 				},
 				version: None,

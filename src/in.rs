@@ -165,6 +165,7 @@ mod tests {
 				skip_draft: None,
 				target_branch: None,
 				max_age_days: None,
+				skip_mr_with_ci_status: None,
 			},
 			version: None,
 		};

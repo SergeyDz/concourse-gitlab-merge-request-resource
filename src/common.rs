@@ -27,6 +27,16 @@ pub struct CommitStatusResponce {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+pub struct CommitStatus {
+	pub id: u64,
+	pub sha: String,
+	pub status: String,
+	pub name: Option<String>,
+	pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Commit {
 	pub committed_date: String,
 }
@@ -100,6 +110,8 @@ pub struct Source {
 	pub target_branch: Option<String>,
 	/// Maximum age in days for merge requests to be considered (default: 90 days / 3 months)
 	pub max_age_days: Option<u32>,
+	/// Skip MRs where the last commit has any CI status (prevents rebuilding already-built MRs)
+	pub skip_mr_with_ci_status: Option<bool>,
 }
 
 pub fn get_data_from<T: for<'de> Deserialize<'de>>(stdin: &mut impl io::Read) -> Result<T, Box<dyn error::Error>> {
@@ -144,6 +156,7 @@ mod tests {
 					skip_draft: None,
 					target_branch: None,
 					max_age_days: None,
+					skip_mr_with_ci_status: None,
 				},
 				version: None,
 			}

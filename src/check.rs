@@ -21,7 +21,7 @@ use gitlab::api::{
 			MergeRequests,
 			MergeRequestDiffs,
 		},
-		repository::commits,
+		repository::{commits, commits::CommitStatuses},
 	},
 	paged,
 	retry::{Backoff, Client as RetryClient},
@@ -69,6 +69,27 @@ use url::Url;
 /// - concourse/git-resource uses /tmp for SSH keys
 /// - concourse/s3-resource uses /tmp for download cache
 /// - concourse/registry-image-resource uses /tmp for layer cache
+/// 
+/// **⚠️ KUBERNETES LIMITATION (MULTI-WORKER DEPLOYMENTS):**
+/// 
+/// If you're running Concourse on Kubernetes with MULTIPLE worker pods:
+/// - `/tmp` is pod-local storage (not shared across pods)
+/// - Each `check` execution may run on a DIFFERENT pod (load balanced)
+/// - State is effectively LOST between checks on different pods ❌
+/// 
+/// **Impact on Multi-Worker Kubernetes Deployments:**
+/// - ✅ Basic functionality still works (state loss is safe, see #3 above)
+/// - ❌ Resurrection logic may not work reliably (can't track resurrected MRs)
+/// - ⚠️ Potential for resurrection loops if state keeps getting lost
+/// 
+/// **Workarounds for Kubernetes:**
+/// 1. Use a single worker pod (not recommended for production)
+/// 2. Use pod affinity to ensure same resource runs on same worker
+/// 3. Implement external storage (S3, GCS, Redis) for state file
+/// 4. Accept state loss and disable resurrection (safest, loses stuck MR detection)
+/// 
+/// For Kubernetes deployments with >1 worker, consider setting environment variable:
+/// `DISABLE_RESURRECTION=true` to prevent potential loops (feature not yet implemented).
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct CheckState {
 	/// SHA hashes of all versions that have been returned to Concourse.
@@ -91,7 +112,23 @@ impl CheckState {
 	/// - Scoped per resource config (Concourse isolates /tmp by resource)
 	/// - Survives container restarts within same resource lifecycle
 	/// - Gets cleaned up when resource config changes or GC runs
+	/// 
+	/// **⚠️ KUBERNETES WARNING**:
+	/// In Kubernetes with multiple worker pods, this file is pod-local and NOT shared.
+	/// State may be lost between checks if they run on different pods.
+	/// This is SAFE (no duplicate builds) but resurrection logic may not work.
 	fn state_file_path() -> PathBuf {
+		// Check if we're in a Kubernetes environment (common env vars)
+		let is_kubernetes = std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
+			|| std::env::var("KUBERNETES_PORT").is_ok();
+		
+		if is_kubernetes {
+			eprintln!("⚠️  Kubernetes environment detected!");
+			eprintln!("   State file is pod-local and may not persist across check runs.");
+			eprintln!("   If you have multiple worker pods, resurrection logic may not work reliably.");
+			eprintln!("   Consider using pod affinity or external storage for production use.");
+		}
+		
 		PathBuf::from("/tmp/gitlab-mr-resource-state.json")
 	}
 	
@@ -423,6 +460,42 @@ fn main() -> Result<()> {
 			continue;
 		}
 		eprintln!("  ✅ Age check passed (MR updated within {} days)", max_age_days);
+		
+		// Check if MR has CI status (optional filter to prevent rebuilding)
+		if input.source.skip_mr_with_ci_status.unwrap_or(false) {
+			eprintln!("  Checking if MR has CI status...");
+			
+			// Query GitLab API for commit statuses using the gitlab crate
+			let statuses_result: Result<Vec<CommitStatus>, _> = paged(
+				CommitStatuses::builder()
+					.project(mr.source_project_id)
+					.commit(&mr.sha)
+					.build()?,
+				Pagination::Limit(1), // We only need to know if ANY status exists
+			)
+			.query(&client);
+			
+			match statuses_result {
+				Ok(statuses) => {
+					if !statuses.is_empty() {
+						let status_info = statuses.iter()
+							.map(|s| format!("{}: {}", s.name.as_ref().unwrap_or(&"unknown".to_string()), s.status))
+							.collect::<Vec<_>>()
+							.join(", ");
+						
+						eprintln!("  ❌ SKIPPED: MR {} - has CI status(es): {}", mr.iid, status_info);
+						eprintln!("    This MR was already built (skip_mr_with_ci_status: true)");
+						skipped_count += 1;
+						continue;
+					} else {
+						eprintln!("    ✅ No CI status found - MR needs building");
+					}
+				},
+				Err(e) => {
+					eprintln!("    ⚠️  Failed to fetch CI statuses: {}, including MR anyway", e);
+				}
+			}
+		}
 		
 		// CRITICAL FIX: Use commit date (with SHA as tie-breaker) to prevent infinite loops
 		// 

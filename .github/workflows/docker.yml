@@ -85,7 +85,7 @@ jobs:
         images: ${{ env.IMAGE_NAME }}
         tags: |
           type=raw,value=${{ steps.tag.outputs.full_version }}
-          type=raw,value=v2,enable={{is_default_branch}}
+          type=raw,value=v3,enable={{is_default_branch}}
           
     - name: Build Docker image
       uses: docker/build-push-action@v5
@@ -115,4 +115,4 @@ jobs:
       run: |
         echo "Published Docker image:"
         echo "- ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.full_version }}"
-        echo "- ${{ env.IMAGE_NAME }}:latest"
+        echo "- ${{ env.IMAGE_NAME }}:v3"

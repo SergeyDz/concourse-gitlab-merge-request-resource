@@ -167,6 +167,7 @@ mod tests {
 				max_age_days: None,
 				commit_date_window_days: None,
 				skip_mr_with_ci_status: None,
+				disable_resurrection: None,
 			},
 			version: None,
 		};

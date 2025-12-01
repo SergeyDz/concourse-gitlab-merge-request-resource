@@ -117,6 +117,8 @@ pub struct Source {
 	pub commit_date_window_days: Option<u32>,
 	/// Skip MRs where the last commit has any CI status (prevents rebuilding already-built MRs)
 	pub skip_mr_with_ci_status: Option<bool>,
+	/// Disable resurrection of stuck MRs (useful for multi-worker Kubernetes environments)
+	pub disable_resurrection: Option<bool>,
 }
 
 pub fn get_data_from<T: for<'de> Deserialize<'de>>(stdin: &mut impl io::Read) -> Result<T, Box<dyn error::Error>> {
@@ -163,6 +165,7 @@ mod tests {
 					max_age_days: None,
 					commit_date_window_days: None,
 					skip_mr_with_ci_status: None,
+					disable_resurrection: None,
 				},
 				version: None,
 			}

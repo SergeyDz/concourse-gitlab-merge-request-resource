@@ -744,7 +744,14 @@ fn main() -> Result<()> {
 		let time_diff_from_now = (Utc::now() - previous_committed_date).num_seconds().abs();
 		let is_recent = time_diff_from_now < 120; // 2 minutes (not 1 hour!)
 		
-		if is_far_future || is_recent {
+		// Check for explicit disable flag (config or env var)
+		let explicitly_disabled = input.source.disable_resurrection.unwrap_or(false) 
+			|| std::env::var("DISABLE_RESURRECTION").unwrap_or_default() == "true";
+
+		if explicitly_disabled {
+			eprintln!("⛔ RESURRECTION DISABLED: Explicitly disabled via config or env var");
+			false
+		} else if is_far_future || is_recent {
 			eprintln!("⛔ RESURRECTION DISABLED: Current version has fake/recent date (within 2 min)");
 			eprintln!("   This prevents infinite loops - resurrection will re-enable in 2 minutes");
 			false
@@ -753,8 +760,17 @@ fn main() -> Result<()> {
 			true
 		}
 	} else {
-		eprintln!("✅ Resurrection enabled (no current version)");
-		true
+		// Check for explicit disable flag (config or env var)
+		let explicitly_disabled = input.source.disable_resurrection.unwrap_or(false) 
+			|| std::env::var("DISABLE_RESURRECTION").unwrap_or_default() == "true";
+			
+		if explicitly_disabled {
+			eprintln!("⛔ RESURRECTION DISABLED: Explicitly disabled via config or env var");
+			false
+		} else {
+			eprintln!("✅ Resurrection enabled (no current version)");
+			true
+		}
 	};
 	
 	if !resurrection_enabled {
@@ -813,47 +829,50 @@ fn main() -> Result<()> {
 			eprintln!("  🔍 MR #{} (SHA: {}) was returned before but is NOT current", version.iid, version.sha);
 			eprintln!("     This MR is stuck in Concourse DB with low check_order!");
 			
-			// OPTIMIZATION: Check CI status ONLY for stuck MRs (not all MRs)
-			// If skip_mr_with_ci_status is enabled, check if this stuck MR already has CI status
-			// If it does, it was already built - no need to resurrect it!
-			if input.source.skip_mr_with_ci_status.unwrap_or(false) {
-				eprintln!("     Checking if stuck MR has CI status before resurrecting...");
+			// OPTIMIZATION & LOOP PREVENTION: Check CI status for stuck MRs
+			// We ALWAYS check this before resurrection to prevent "Ping-Pong" loops where
+			// two active MRs keep resurrecting each other because they take turns being "current".
+			// If an MR has CI status, it was already built - DO NOT RESURRECT IT.
+			eprintln!("     Checking if stuck MR has CI status before resurrecting...");
+			
+			// Look up the MR to get its source_project_id
+			let mut has_ci_status = false;
+			if let Some(mr) = sha_to_mr.get(&version.sha) {
+				// Query GitLab API for commit statuses
+				let statuses_result: Result<Vec<CommitStatus>, _> = paged(
+					CommitStatuses::builder()
+						.project(mr.source_project_id)
+						.commit(&version.sha)
+						.build()?,
+					Pagination::Limit(1), // We only need to know if ANY status exists
+				)
+				.query(&client);
 				
-				// Look up the MR to get its source_project_id
-				if let Some(mr) = sha_to_mr.get(&version.sha) {
-					// Query GitLab API for commit statuses
-					let statuses_result: Result<Vec<CommitStatus>, _> = paged(
-						CommitStatuses::builder()
-							.project(mr.source_project_id)
-							.commit(&version.sha)
-							.build()?,
-						Pagination::Limit(1), // We only need to know if ANY status exists
-					)
-					.query(&client);
-					
-					match statuses_result {
-						Ok(statuses) => {
-							if !statuses.is_empty() {
-								let status_info = statuses.iter()
-									.map(|s| format!("{}: {}", s.name.as_ref().unwrap_or(&"unknown".to_string()), s.status))
-									.collect::<Vec<_>>()
-									.join(", ");
-								
-								eprintln!("     ✅ SKIP RESURRECTION: MR #{} already has CI status: {}", version.iid, status_info);
-								eprintln!("        This stuck MR was already built - no need to resurrect!");
-								// Don't resurrect - just skip this version entirely
-								continue;
-							} else {
-								eprintln!("     ⚠️  No CI status found - MR needs resurrection to rebuild");
-							}
-						},
-						Err(e) => {
-							eprintln!("     ⚠️  Failed to fetch CI statuses: {}, resurrecting anyway", e);
+				match statuses_result {
+					Ok(statuses) => {
+						if !statuses.is_empty() {
+							let status_info = statuses.iter()
+								.map(|s| format!("{}: {}", s.name.as_ref().unwrap_or(&"unknown".to_string()), s.status))
+								.collect::<Vec<_>>()
+								.join(", ");
+							
+							eprintln!("     ✅ SKIP RESURRECTION: MR #{} already has CI status: {}", version.iid, status_info);
+							eprintln!("        This stuck MR was already built - no need to resurrect!");
+							has_ci_status = true;
+						} else {
+							eprintln!("     ⚠️  No CI status found - MR needs resurrection to rebuild");
 						}
+					},
+					Err(e) => {
+						eprintln!("     ⚠️  Failed to fetch CI statuses: {}, resurrecting anyway", e);
 					}
-				} else {
-					eprintln!("     ⚠️  MR not found in lookup map, resurrecting anyway");
 				}
+			} else {
+				eprintln!("     ⚠️  MR not found in lookup map, resurrecting anyway");
+			}
+
+			if has_ci_status {
+				continue;
 			}
 			
 			eprintln!("     🚑 RESURRECTING with current UTC time as fake date to force rebuild!");

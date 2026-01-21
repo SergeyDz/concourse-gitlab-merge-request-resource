@@ -72,24 +72,29 @@ mod check_filtering_tests {
         for version in newer_versions {
             let iid = version.iid.clone();
             
+            // Check if we already have a version for this MR
             if let Some(existing) = mr_latest.get(&iid) {
                 let existing_dt = DateTime::<Utc>::from_str(&existing.committed_date).unwrap();
                 let candidate_dt = DateTime::<Utc>::from_str(&version.committed_date).unwrap();
                 
+                // Keep the later commit
                 if candidate_dt > existing_dt {
                     mr_latest.insert(iid, version);
                 }
+                // If candidate is not newer, we keep existing (no else needed)
             } else {
+                // First version for this MR
                 mr_latest.insert(iid, version);
             }
         }
         
-        // Always include current version
+        // Always ensure current version is included (Concourse contract)
         let current_iid = &current_version.iid;
         if !mr_latest.contains_key(current_iid) {
             mr_latest.insert(current_iid.clone(), current_version.clone());
         }
         
+        // Convert HashMap back to Vec and sort by committed_date
         let mut result: Vec<Version> = mr_latest.into_values().collect();
         result.sort_by(|a, b| a.committed_date.cmp(&b.committed_date));
         result

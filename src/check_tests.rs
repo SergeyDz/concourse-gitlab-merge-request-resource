@@ -292,27 +292,27 @@ mod check_filtering_tests {
     fn test_b4_five_mrs_multiple_commits_each() {
         let current = make_version(100, -200, "current");
         let all_commits = vec![
-            // MR 77: 3 commits
-            make_version_at(77, "2025-10-09T10:00:00+00:00", "77a"),
-            make_version_at(77, "2025-10-09T10:05:00+00:00", "77b"),
-            make_version_at(77, "2025-10-09T10:10:00+00:00", "77c"),
+            // MR 77: 3 commits (use relative times)
+            make_version(77, -100, "77a"),
+            make_version(77, -95, "77b"),
+            make_version(77, -90, "77c"),
             
             // MR 78: 2 commits
-            make_version_at(78, "2025-10-09T10:15:00+00:00", "78a"),
-            make_version_at(78, "2025-10-09T10:20:00+00:00", "78b"),
+            make_version(78, -85, "78a"),
+            make_version(78, -80, "78b"),
             
             // MR 79: 1 commit
-            make_version_at(79, "2025-10-09T10:25:00+00:00", "79a"),
+            make_version(79, -75, "79a"),
             
             // MR 80: 4 commits
-            make_version_at(80, "2025-10-09T10:30:00+00:00", "80a"),
-            make_version_at(80, "2025-10-09T10:35:00+00:00", "80b"),
-            make_version_at(80, "2025-10-09T10:40:00+00:00", "80c"),
-            make_version_at(80, "2025-10-09T10:45:00+00:00", "80d"),
+            make_version(80, -70, "80a"),
+            make_version(80, -65, "80b"),
+            make_version(80, -60, "80c"),
+            make_version(80, -55, "80d"),
             
             // MR 81: 2 commits
-            make_version_at(81, "2025-10-09T10:50:00+00:00", "81a"),
-            make_version_at(81, "2025-10-09T10:55:00+00:00", "81b"),
+            make_version(81, -50, "81a"),
+            make_version(81, -45, "81b"),
         ];
         
         let result = filter_versions(all_commits, Some(&current));
@@ -476,11 +476,11 @@ mod check_filtering_tests {
     #[test]
     fn test_c3_same_sha_ten_mrs_massive_cherry_pick() {
         let current = make_version(200, -300, "current");
-        let shared_time = "2025-10-09T10:00:00+00:00";
         let mut mrs = vec![];
         
         for iid in 50..60 {
-            mrs.push(make_version_at(iid, shared_time, "hotfix_sha"));
+            // Use relative time so all MRs are recent
+            mrs.push(make_version(iid, -150, "hotfix_sha"));
         }
         
         let result = filter_versions(mrs, Some(&current));
@@ -506,12 +506,13 @@ mod check_filtering_tests {
     #[test]
     fn test_c5_same_sha_all_older_than_current_included() {
         let current = make_version(100, -10, "current");  // Recent
-        let old1 = make_version_at(50, "2025-10-08T10:00:00+00:00", "old_sha");
-        let old2 = make_version_at(60, "2025-10-08T10:00:00+00:00", "old_sha");
+        // Use relative time - both MRs 24 hours (1440 minutes) before current
+        let old1 = make_version(50, -1450, "old_sha");
+        let old2 = make_version(60, -1450, "old_sha");
         
         let result = filter_versions(vec![old1, old2], Some(&current));
         
-        // With new logic: include different MRs within 90-day window (~6 days difference)
+        // With new logic: include different MRs within 90-day window (1 day difference)
         assert_eq!(result.len(), 3);  // current + 2 older MRs
         assert!(result.iter().any(|v| v.iid == "50"));
         assert!(result.iter().any(|v| v.iid == "60"));

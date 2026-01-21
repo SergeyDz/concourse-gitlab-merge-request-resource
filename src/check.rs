@@ -381,8 +381,22 @@ fn main() -> Result<()> {
 		eprintln!("\n--- Processing MR {}/{} ---", index + 1, mrs.len());
 		eprintln!("MR #{} - Title: {}", mr.iid, mr.title);
 		eprintln!("  Updated at: {}", mr.updated_at);
-		eprintln!("  SHA: {}", mr.sha);
-		eprintln!("  Source branch: {}", mr.source_branch);
+		
+		// Check if SHA is null (happens when source branch is deleted)
+		let sha = match &mr.sha {
+			Some(s) => s,
+			None => {
+				eprintln!("  ⚠️  WARNING: MR {} has null SHA (source branch likely deleted)", mr.iid);
+				eprintln!("  ❌ SKIPPED: Cannot process MR without SHA");
+				skipped_count += 1;
+				continue;
+			}
+		};
+		
+		let source_branch = mr.source_branch.as_deref().unwrap_or("<deleted>");
+		
+		eprintln!("  SHA: {}", sha);
+		eprintln!("  Source branch: {}", source_branch);
 		eprintln!("  Labels: {:?}", mr.labels);
 		
 		// Apply path filtering if specified (before fetching commit to save API calls)
@@ -429,10 +443,10 @@ fn main() -> Result<()> {
 		}
 
 		// Get the commit information for the MR
-		eprintln!("  Fetching commit details for SHA {}...", mr.sha);
+		eprintln!("  Fetching commit details for SHA {}...", sha);
 		let commit: Commit = commits::Commit::builder()
 			.project(mr.source_project_id)
-			.commit(&mr.sha)
+			.commit(sha)
 			.build()?
 			.query(&client)?;
 
@@ -483,7 +497,7 @@ fn main() -> Result<()> {
 		let version = Version {
 			iid: mr.iid.to_string(),
 			committed_date: commit.committed_date.clone(), // ← Use actual commit date
-			sha: mr.sha.clone(),
+			sha: sha.clone(),
 		};
 
 		eprintln!("  ✅ INCLUDING MR {} in candidate versions", mr.iid);
@@ -505,7 +519,9 @@ fn main() -> Result<()> {
 	use std::collections::HashMap;
 	let mut sha_to_mr: HashMap<String, &MergeRequest> = HashMap::new();
 	for mr in &mrs {
-		sha_to_mr.insert(mr.sha.clone(), mr);
+		if let Some(ref sha) = mr.sha {
+			sha_to_mr.insert(sha.clone(), mr);
+		}
 	}
 
 	// Sort versions by committed_date ascending (oldest first) for Concourse

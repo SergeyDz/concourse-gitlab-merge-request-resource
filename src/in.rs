@@ -84,6 +84,13 @@ fn main() -> Result<()> {
 		.merge_request(version.iid.parse::<u64>()?)
 		.build()?
 		.query(&client)?;
+	
+	// Check if SHA is null (happens when source branch is deleted)
+	let sha = mr.sha.as_ref()
+		.ok_or_else(|| anyhow!("MR {} has null SHA - source branch likely deleted", version.iid))?;
+	
+	let source_branch = mr.source_branch.as_ref()
+		.ok_or_else(|| anyhow!("MR {} has null source_branch - branch likely deleted", version.iid))?;
 
 	let project: Project = projects::Project::builder()
 		.project(mr.source_project_id)
@@ -121,15 +128,15 @@ fn main() -> Result<()> {
 		let mut builder = RepoBuilder::new();
 		let repo = builder
 			.fetch_options(fo)
-			.branch(&mr.source_branch)
+			.branch(source_branch)
 			.clone(&project.http_url_to_repo, Path::new(&args.directory))
 			.with_context(|| anyhow!("failed to clone repository"))?;
 		repo.reset(
-			&repo.find_object(Oid::from_str(&mr.sha).unwrap(), None).unwrap(),
+			&repo.find_object(Oid::from_str(sha).unwrap(), None).unwrap(),
 			git2::ResetType::Hard,
 			None,
 		)
-		.with_context(|| anyhow!("failed to checkout {}", &mr.sha))?;
+		.with_context(|| anyhow!("failed to checkout {}", sha))?;
 	}
 
 	/* Dump version to a file for out */

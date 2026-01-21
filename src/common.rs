@@ -85,11 +85,13 @@ pub struct MergeRequest {
 	pub iid: u64,
 	pub title: String,
 	pub labels: Vec<String>,
-	pub sha: String,
+	/// SHA can be null when the source branch is deleted but MR is still open
+	pub sha: Option<String>,
 	pub author: Author,
 	pub updated_at: String,
 	pub source_project_id: u64,
-	pub source_branch: String,
+	/// Source branch can be null when the source branch is deleted
+	pub source_branch: Option<String>,
 	pub web_url: String,
 }
 
